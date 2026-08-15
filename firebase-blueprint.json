@@ -1,0 +1,27 @@
+{
+  "entities": {
+    "UserProfile": {
+      "collection": "users",
+      "fields": {
+        "email": "string",
+        "displayName": "string",
+        "photoURL": "string",
+        "createdAt": "timestamp",
+        "lastLoginAt": "timestamp"
+      }
+    },
+    "Project": {
+      "collection": "projects",
+      "fields": {
+        "userId": "string",
+        "title": "string",
+        "scriptText": "string",
+        "lines": "array",
+        "selections": "map",
+        "step": "string",
+        "createdAt": "timestamp",
+        "updatedAt": "timestamp"
+      }
+    }
+  }
+}

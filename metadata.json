@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix ScriptSync AI",
+  "description": "AI-powered video creation studio that synchronizes numbered scripts, voice clips, and candidate images into polished vertical video with AI matching and Firestore cloud persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
