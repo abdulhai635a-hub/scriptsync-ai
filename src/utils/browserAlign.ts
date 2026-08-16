@@ -84,6 +84,10 @@ export async function transcribeInBrowser(
   if (onProgress) onProgress('Preparing audio...', 2);
   const audio = await audioToFloat32Mono16k(file);
 
+  // Record where the speaker pauses. Line boundaries are snapped to these
+  // later, so cuts land in a natural gap instead of part-way through a word.
+  lastSilences = detectSilences(audio, 16000);
+
   const words = await new Promise<WordStamp[]>((resolve, reject) => {
     let worker: Worker;
     try {
@@ -244,6 +248,49 @@ function alignSequences(scriptWords: string[], asrWords: string[]): number[] {
     }
   }
   return mapping;
+}
+
+/** Pauses detected in the narration, as [start, end] second pairs. */
+export let lastSilences: Array<[number, number]> = [];
+
+/**
+ * Find pauses in the narration.
+ *
+ * Narration of this kind has a clear gap at the end of nearly every sentence,
+ * and those gaps are where a cut belongs. Having them available lets the
+ * boundary between two lines be placed on a real pause rather than wherever
+ * the word matching happened to land.
+ */
+export function detectSilences(
+  audio: Float32Array,
+  sampleRate: number,
+  threshold = 0.012,
+  minPause = 0.25
+): Array<[number, number]> {
+  const frame = Math.max(1, Math.floor(sampleRate * 0.02)); // 20ms
+  const frames = Math.floor(audio.length / frame);
+  const need = Math.max(1, Math.round(minPause / 0.02));
+
+  const out: Array<[number, number]> = [];
+  let run = 0;
+  for (let i = 0; i < frames; i++) {
+    let sum = 0;
+    const base = i * frame;
+    for (let k = 0; k < frame; k++) {
+      const v = audio[base + k];
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / frame);
+
+    if (rms < threshold) {
+      run++;
+    } else {
+      if (run >= need) out.push([(i - run) * 0.02, i * 0.02]);
+      run = 0;
+    }
+  }
+  if (run >= need) out.push([(frames - run) * 0.02, frames * 0.02]);
+  return out;
 }
 
 /** Lines from the most recent alignWordsToLines call that had no real word match. */
@@ -571,6 +618,57 @@ export function alignWordsToLines(
         bounds[k] = cursor;
         cursor += share;
       }
+    }
+  }
+
+  // ---- Snap boundaries onto real pauses --------------------------------
+  //
+  // Word matching gets a boundary roughly right, but "roughly" can mean a
+  // whole sentence out when two consecutive lines both end in common words.
+  // The narration itself is a better guide: there is a pause at the end of
+  // nearly every sentence, so the cut belongs in one of those.
+  //
+  // Among the pauses near the computed boundary, the chosen one balances two
+  // things - how far it moves the boundary, and how well the resulting clip
+  // lengths match what each line's word count says they should be. That second
+  // term is what rules out an adjacent pause a sentence too late, which would
+  // leave one line overlong and the next one clipped short.
+  if (lastSilences.length > 0) {
+    const SEARCH = 3.0; // seconds either side
+
+    for (let i = 1; i < lineCount; i++) {
+      const anchor = bounds[i];
+      const prevBound = bounds[i - 1];
+      const nextBound = bounds[i + 1];
+
+      const expPrev = expectedFor(i - 1);
+      const expNext = expectedFor(i);
+
+      const score = (b: number) => {
+        const dPrev = b - prevBound;
+        const dNext = nextBound - b;
+        if (dPrev < 0.2 || dNext < 0.2) return Infinity;
+        // Relative duration error for the two lines this boundary separates
+        const errPrev = Math.abs(dPrev - expPrev) / Math.max(0.5, expPrev);
+        const errNext = Math.abs(dNext - expNext) / Math.max(0.5, expNext);
+        const move = Math.abs(b - anchor) / SEARCH;
+        return errPrev + errNext + move * 0.6;
+      };
+
+      let best = anchor;
+      let bestScore = score(anchor);
+
+      for (const [sStart, sEnd] of lastSilences) {
+        const mid = (sStart + sEnd) / 2;
+        if (mid < anchor - SEARCH) continue;
+        if (mid > anchor + SEARCH) break;
+        const sc = score(mid);
+        if (sc < bestScore) {
+          bestScore = sc;
+          best = mid;
+        }
+      }
+      bounds[i] = best;
     }
   }
 
