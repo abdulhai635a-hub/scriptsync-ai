@@ -68,8 +68,13 @@ self.onmessage = async (event) => {
   const { audio, modelId } = event.data || {};
 
   const SAMPLE_RATE = 16000;
-  const WINDOW_S = 25;   // Whisper handles 30s natively; 25 leaves headroom
-  const OVERLAP_S = 2;   // so a word straddling a boundary is caught by one side
+  const WINDOW_S = 30;   // Whisper's native input length
+  // Whisper reliably loses a few seconds at the very start and end of each
+  // chunk it's given, so neighbouring windows must overlap by more than that
+  // loss or a hole opens exactly on the boundary — which is what produced the
+  // gap seen at 46s, precisely where one window began. 8s covers the observed
+  // loss with margin.
+  const OVERLAP_S = 8;
 
   try {
     const model = await getTranscriber(modelId || 'onnx-community/whisper-base_timestamped');
@@ -141,7 +146,7 @@ self.onmessage = async (event) => {
     const holes = [];
     for (let i = 1; i < words.length; i++) {
       const gap = words[i].start - words[i - 1].end;
-      if (gap > 4) holes.push(`${words[i - 1].end.toFixed(0)}s-${words[i].start.toFixed(0)}s`);
+      if (gap > 2.5) holes.push(`${words[i - 1].end.toFixed(0)}s-${words[i].start.toFixed(0)}s`);
     }
 
     post('done', { words, holes });
