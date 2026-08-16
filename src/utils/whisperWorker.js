@@ -64,6 +64,60 @@ async function getTranscriber(modelId) {
   return transcriber;
 }
 
+function countWords(chunks) {
+  let n = 0;
+  for (const c of chunks || []) if (String(c?.text ?? '').trim()) n++;
+  return n;
+}
+
+async function transcribeWindow(model, audioSlice) {
+  try {
+    const out = await model(audioSlice, { return_timestamps: 'word' });
+    return out?.chunks || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+/**
+ * Bring a window to a consistent loudness before recognition.
+ *
+ * A passage that is simply quieter than the rest is the classic cause of
+ * Whisper returning almost nothing for it. Normalising the track as a whole
+ * can't fix that, because the loud passages set the scale and the quiet one
+ * stays quiet. Normalising each window on its own does.
+ *
+ * The target is RMS rather than peak: peak normalisation is thrown off by a
+ * single click or breath, and pushing a whole window to full scale distorts it.
+ * Whisper behaves best around an RMS of 0.05-0.25.
+ */
+function normaliseWindow(slice, targetRms = 0.12, maxGain = 15) {
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < slice.length; i++) {
+    const v = slice[i];
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+    sumSq += v * v;
+  }
+  if (peak < 1e-6) return slice; // silence: nothing to lift
+
+  const rms = Math.sqrt(sumSq / slice.length);
+  if (rms < 1e-7) return slice;
+
+  let gain = Math.min(maxGain, targetRms / rms);
+  if (gain <= 1.01) return slice; // already loud enough
+
+  const out = new Float32Array(slice.length);
+  for (let i = 0; i < slice.length; i++) {
+    let v = slice[i] * gain;
+    if (v > 1) v = 1;
+    else if (v < -1) v = -1;
+    out[i] = v;
+  }
+  return out;
+}
+
 self.onmessage = async (event) => {
   const { audio, modelId } = event.data || {};
 
@@ -77,7 +131,7 @@ self.onmessage = async (event) => {
   const OVERLAP_S = 8;
 
   try {
-    const model = await getTranscriber(modelId || 'onnx-community/whisper-base_timestamped');
+    const model = await getTranscriber(modelId || 'onnx-community/whisper-small_timestamped');
 
     const totalSec = audio.length / SAMPLE_RATE;
 
@@ -106,15 +160,25 @@ self.onmessage = async (event) => {
         pct: 32 + (from / totalSec) * 55
       });
 
-      let output;
-      try {
-        output = await model(slice, { return_timestamps: 'word' });
-      } catch (windowErr) {
-        // One bad window shouldn't lose the whole transcript
-        continue;
+      // Normalise each window on its own rather than the track as a whole.
+      // A passage that is simply quieter than the rest is the classic cause of
+      // Whisper returning almost nothing for it — global normalisation can't
+      // help because the loud parts set the scale. Per-window gain puts every
+      // stretch at a level the model can actually hear.
+      const boosted = normaliseWindow(slice);
+
+      let chunks = await transcribeWindow(model, boosted);
+
+      // If a window comes back implausibly sparse for its length, the audio was
+      // probably still too quiet or too noisy. Retry once with a harder gain
+      // before accepting that there is nothing there.
+      const spokenSec = to - from;
+      if (countWords(chunks) < spokenSec / 4) {
+        const harder = normaliseWindow(slice, 0.22, 40);
+        const retry = await transcribeWindow(model, harder);
+        if (countWords(retry) > countWords(chunks)) chunks = retry;
       }
 
-      const chunks = output?.chunks || [];
       const lastEnd = words.length ? words[words.length - 1].end : -1;
 
       for (const c of chunks) {
