@@ -65,68 +65,13 @@ export async function audioToFloat32Mono16k(file: File | Blob): Promise<Float32A
 }
 
 // ---------------------------------------------------------------------------
-// 2. Transcription in the browser (model is cached by the browser after first run)
+// 2. Transcription in a Web Worker (keeps the page responsive)
+//
+// Whisper inference takes minutes on long audio. Running it on the main thread
+// freezes the UI and trips the browser's "Page Unresponsive" dialog, so all of
+// it happens in a worker. Audio decoding stays on the main thread because
+// AudioContext isn't available inside workers.
 // ---------------------------------------------------------------------------
-
-let _transcriber: any = null;
-let _libPromise: Promise<any> | null = null;
-
-// Loaded from a CDN at runtime rather than bundled: the npm package pulls in a
-// Node-only ONNX runtime that isn't needed in the browser and bloats the build.
-// Several URL shapes are tried because a plain /npm/pkg@ver path can resolve to
-// the CommonJS build, which won't load as an ES module in the browser.
-const TRANSFORMERS_CDNS = [
-  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm',
-  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.web.js',
-  'https://unpkg.com/@huggingface/transformers@3.8.1/dist/transformers.web.js'
-];
-
-async function loadTransformers(): Promise<any> {
-  if (_libPromise) return _libPromise;
-
-  _libPromise = (async () => {
-    const errors: string[] = [];
-    for (const url of TRANSFORMERS_CDNS) {
-      try {
-        const mod = await import(/* @vite-ignore */ url);
-        if (mod && typeof mod.pipeline === 'function') {
-          console.log('[browserAlign] loaded transformers.js from', url);
-          return mod;
-        }
-        errors.push(`${url}: loaded but no pipeline export`);
-      } catch (e: any) {
-        errors.push(`${url}: ${e?.message || e}`);
-      }
-    }
-    throw new Error(`Could not load speech library. Tried:\n${errors.join('\n')}`);
-  })();
-
-  // Don't cache a rejected promise: allow a retry on the next attempt
-  _libPromise.catch(() => {
-    _libPromise = null;
-  });
-
-  return _libPromise;
-}
-
-async function getTranscriber(modelId: string, onProgress?: ProgressFn) {
-  if (_transcriber) return _transcriber;
-
-  const { pipeline } = await loadTransformers();
-
-  if (onProgress) onProgress('Loading speech model (first time only, cached after)...', 5);
-
-  _transcriber = await pipeline('automatic-speech-recognition', modelId, {
-    dtype: 'q8',
-    progress_callback: (p: any) => {
-      if (onProgress && p?.status === 'progress' && typeof p.progress === 'number') {
-        onProgress(`Downloading speech model... ${Math.round(p.progress)}%`, 5 + (p.progress * 0.25));
-      }
-    }
-  } as any);
-
-  return _transcriber;
-}
 
 export async function transcribeInBrowser(
   file: File | Blob,
@@ -139,38 +84,41 @@ export async function transcribeInBrowser(
   if (onProgress) onProgress('Preparing audio...', 2);
   const audio = await audioToFloat32Mono16k(file);
 
-  const transcriber = await getTranscriber(modelId, onProgress);
+  const words = await new Promise<WordStamp[]>((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL('./whisperWorker.js', import.meta.url), { type: 'module' });
+    } catch (e: any) {
+      reject(new Error(`Could not start background worker: ${e?.message || e}`));
+      return;
+    }
 
-  if (onProgress) onProgress('Transcribing audio in your browser...', 32);
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      worker.terminate();
+      fn();
+    };
 
-  const output: any = await transcriber(audio, {
-    return_timestamps: 'word',
-    chunk_length_s: 30,
-    stride_length_s: 5
+    worker.onmessage = (event: MessageEvent) => {
+      const data = event.data || {};
+      if (data.type === 'progress') {
+        if (onProgress) onProgress(data.message, data.pct >= 0 ? data.pct : undefined);
+      } else if (data.type === 'done') {
+        finish(() => resolve(data.words || []));
+      } else if (data.type === 'error') {
+        finish(() => reject(new Error(data.message || 'Transcription failed')));
+      }
+    };
+
+    worker.onerror = (e: ErrorEvent) => {
+      finish(() => reject(new Error(`Worker error: ${e.message || 'unknown'}`)));
+    };
+
+    // Transfer the sample buffer rather than copying it (audio can be large)
+    worker.postMessage({ audio, modelId }, [audio.buffer]);
   });
-
-  const chunks: any[] = output?.chunks || [];
-  const words: WordStamp[] = [];
-
-  for (const c of chunks) {
-    const ts = c?.timestamp;
-    const text = String(c?.text ?? '').trim();
-    if (!text) continue;
-    const start = Array.isArray(ts) ? ts[0] : undefined;
-    const end = Array.isArray(ts) ? ts[1] : undefined;
-    if (typeof start !== 'number') continue;
-    words.push({
-      word: text,
-      start,
-      end: typeof end === 'number' && end > start ? end : start + 0.15
-    });
-  }
-
-  if (chunks.length > 0 && words.length === 0) {
-    throw new Error(
-      'The speech model returned text but no word timings. This model may not support word-level timestamps.'
-    );
-  }
 
   if (onProgress) {
     const lastEnd = words.length > 0 ? words[words.length - 1].end : 0;
