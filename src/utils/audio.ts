@@ -388,8 +388,17 @@ export async function alignAudioWithScript(
         method: browserResult.method
       };
     }
-  } catch (browserErr) {
-    console.log('Browser alignment unavailable, trying server:', browserErr);
+
+    // Browser path didn't produce a real alignment: make the reason visible
+    // rather than silently degrading to guessed timings.
+    if (browserResult.warnings.length > 0 && onProgress) {
+      onProgress(browserResult.warnings[0]);
+    }
+    console.log('[align] browser alignment did not succeed:', browserResult.warnings);
+  } catch (browserErr: any) {
+    const detail = browserErr?.message || String(browserErr);
+    console.log('Browser alignment unavailable, trying server:', detail);
+    if (onProgress) onProgress(`Browser alignment unavailable: ${detail}`);
   }
 
   try {

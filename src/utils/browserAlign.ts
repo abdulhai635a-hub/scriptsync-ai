@@ -71,14 +71,41 @@ export async function audioToFloat32Mono16k(file: File | Blob): Promise<Float32A
 let _transcriber: any = null;
 let _libPromise: Promise<any> | null = null;
 
-const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
-
 // Loaded from a CDN at runtime rather than bundled: the npm package pulls in a
 // Node-only ONNX runtime that isn't needed in the browser and bloats the build.
-function loadTransformers(): Promise<any> {
-  if (!_libPromise) {
-    _libPromise = import(/* @vite-ignore */ TRANSFORMERS_CDN);
-  }
+// Several URL shapes are tried because a plain /npm/pkg@ver path can resolve to
+// the CommonJS build, which won't load as an ES module in the browser.
+const TRANSFORMERS_CDNS = [
+  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm',
+  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.web.js',
+  'https://unpkg.com/@huggingface/transformers@3.8.1/dist/transformers.web.js'
+];
+
+async function loadTransformers(): Promise<any> {
+  if (_libPromise) return _libPromise;
+
+  _libPromise = (async () => {
+    const errors: string[] = [];
+    for (const url of TRANSFORMERS_CDNS) {
+      try {
+        const mod = await import(/* @vite-ignore */ url);
+        if (mod && typeof mod.pipeline === 'function') {
+          console.log('[browserAlign] loaded transformers.js from', url);
+          return mod;
+        }
+        errors.push(`${url}: loaded but no pipeline export`);
+      } catch (e: any) {
+        errors.push(`${url}: ${e?.message || e}`);
+      }
+    }
+    throw new Error(`Could not load speech library. Tried:\n${errors.join('\n')}`);
+  })();
+
+  // Don't cache a rejected promise: allow a retry on the next attempt
+  _libPromise.catch(() => {
+    _libPromise = null;
+  });
+
   return _libPromise;
 }
 
@@ -104,7 +131,10 @@ async function getTranscriber(modelId: string, onProgress?: ProgressFn) {
 export async function transcribeInBrowser(
   file: File | Blob,
   onProgress?: ProgressFn,
-  modelId = 'onnx-community/whisper-base'
+  // Must be a "_timestamped" export: only those ship the alignment_heads
+  // config that word-level timestamps depend on. The plain whisper exports
+  // silently return no word timings.
+  modelId = 'onnx-community/whisper-base_timestamped'
 ): Promise<WordStamp[]> {
   if (onProgress) onProgress('Preparing audio...', 2);
   const audio = await audioToFloat32Mono16k(file);
@@ -134,6 +164,12 @@ export async function transcribeInBrowser(
       start,
       end: typeof end === 'number' && end > start ? end : start + 0.15
     });
+  }
+
+  if (chunks.length > 0 && words.length === 0) {
+    throw new Error(
+      'The speech model returned text but no word timings. This model may not support word-level timestamps.'
+    );
   }
 
   if (onProgress) onProgress('Matching transcript to your script...', 88);
@@ -394,8 +430,9 @@ export async function alignInBrowser(
       warnings
     };
   } catch (err: any) {
-    console.log('Browser alignment failed:', err?.message || err);
-    warnings.push('Browser speech alignment was unavailable; used proportional spacing.');
+    const detail = err?.message || String(err);
+    console.log('Browser alignment failed:', detail);
+    warnings.push(`Browser speech alignment failed: ${detail}`);
     return {
       timestamps: proportionalFallback(scriptLines, totalDuration),
       method: 'proportional-acoustic',
