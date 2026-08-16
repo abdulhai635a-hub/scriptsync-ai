@@ -172,7 +172,18 @@ export async function transcribeInBrowser(
     );
   }
 
-  if (onProgress) onProgress('Matching transcript to your script...', 88);
+  if (onProgress) {
+    const lastEnd = words.length > 0 ? words[words.length - 1].end : 0;
+    const firstStart = words.length > 0 ? words[0].start : 0;
+    onProgress(
+      `Recognized ${words.length} words spanning ${firstStart.toFixed(1)}s - ${lastEnd.toFixed(1)}s. Matching to your script...`,
+      88
+    );
+  }
+  console.log(
+    '[browserAlign] words:', words.length,
+    '| span:', words.length ? `${words[0].start}s - ${words[words.length - 1].end}s` : 'none'
+  );
   return words;
 }
 
@@ -199,13 +210,34 @@ interface FlatScriptWord {
   norm: string;
 }
 
+/**
+ * Cheap similarity check used inside the DP inner loop.
+ * Exact match scores highest; near-misses (shared prefix and similar length)
+ * get partial credit so that transcription variants — "recieve"/"receive",
+ * "goin"/"going", singular/plural — still anchor a line instead of dropping
+ * out and leaving a gap that has to be guessed.
+ * Must stay O(1): this runs millions of times.
+ */
+function wordScore(a: string, b: string): number {
+  if (a === b && a.length > 0) return 2;
+  if (a.length === 0 || b.length === 0) return -1;
+
+  // Shared prefix of 3+ characters with comparable length
+  const minLen = Math.min(a.length, b.length);
+  if (minLen >= 3 && Math.abs(a.length - b.length) <= 3) {
+    if (a[0] === b[0] && a[1] === b[1] && a[2] === b[2]) return 1;
+  }
+  // Short words: require first 2 chars
+  if (minLen >= 2 && a.length <= 4 && b.length <= 4 && a[0] === b[0] && a[1] === b[1]) return 1;
+
+  return -1;
+}
+
 /** Align script words to ASR words. Returns, for each script word, the index of the matched ASR word (or -1). */
 function alignSequences(scriptWords: string[], asrWords: string[]): number[] {
   const n = scriptWords.length;
   const m = asrWords.length;
 
-  const MATCH = 2;
-  const MISMATCH = -1;
   const GAP = -1;
 
   // Score matrix as a flat typed array for memory efficiency
@@ -227,8 +259,7 @@ function alignSequences(scriptWords: string[], asrWords: string[]): number[] {
     const rowOff = i * width;
     const prevOff = (i - 1) * width;
     for (let j = 1; j <= m; j++) {
-      const isMatch = sw === asrWords[j - 1] && sw.length > 0;
-      const diag = score[prevOff + j - 1] + (isMatch ? MATCH : MISMATCH);
+      const diag = score[prevOff + j - 1] + wordScore(sw, asrWords[j - 1]);
       const up = score[prevOff + j] + GAP;
       const left = score[rowOff + j - 1] + GAP;
 
@@ -265,6 +296,9 @@ function alignSequences(scriptWords: string[], asrWords: string[]): number[] {
   }
   return mapping;
 }
+
+/** Lines from the most recent alignWordsToLines call that had no real word match. */
+export let lastUnanchoredLines: number[] = [];
 
 /**
  * Turn word-level timestamps into per-line timestamps.
@@ -325,7 +359,23 @@ export function alignWordsToLines(
     }
   }
 
-  // Interpolate lines that matched nothing, using the nearest anchored lines
+  // Record which lines had no real word match, so callers can report them
+  const unanchored: number[] = [];
+  for (let i = 0; i < lineCount; i++) {
+    if (rawStart[i] === null) unanchored.push(scriptLines[i].num ?? i + 1);
+  }
+  lastUnanchoredLines = unanchored;
+
+  // Interpolate lines that matched nothing, using the nearest anchored lines.
+  // The gap is shared out in proportion to how much each line actually says,
+  // rather than evenly: a 20-word line and a 3-word line should not get the
+  // same slice of time.
+  const lineWeight = (idx: number) => {
+    const t = String(scriptLines[idx].text || '').trim();
+    const wordCount = t ? t.split(/\s+/).length : 1;
+    return Math.max(1, wordCount);
+  };
+
   for (let i = 0; i < lineCount; i++) {
     if (rawStart[i] !== null) continue;
 
@@ -336,12 +386,20 @@ export function alignWordsToLines(
 
     const from = prev >= 0 ? (rawEnd[prev] as number) : 0;
     const to = next < lineCount ? (rawStart[next] as number) : totalDuration;
-    const gapCount = next - prev - 1;
-    const slot = gapCount > 0 ? (to - from) / gapCount : 0;
-    const offset = i - prev - 1;
 
-    rawStart[i] = from + slot * offset;
-    rawEnd[i] = from + slot * (offset + 1);
+    // Every line in this unanchored run, so we can weight across the whole run
+    const runStart = prev + 1;
+    const runEnd = next - 1;
+    let totalWeight = 0;
+    for (let k = runStart; k <= runEnd; k++) totalWeight += lineWeight(k);
+    if (totalWeight <= 0) totalWeight = 1;
+
+    let before = 0;
+    for (let k = runStart; k < i; k++) before += lineWeight(k);
+
+    const span = Math.max(0, to - from);
+    rawStart[i] = from + (span * before) / totalWeight;
+    rawEnd[i] = from + (span * (before + lineWeight(i))) / totalWeight;
   }
 
   // Enforce monotonic, non-overlapping, in-range boundaries
@@ -422,7 +480,35 @@ export async function alignInBrowser(
     }
 
     const timestamps = alignWordsToLines(words, scriptLines, totalDuration);
-    if (onProgress) onProgress('Alignment complete.', 100);
+
+    const coveredTo = words[words.length - 1].end;
+    const coverage = totalDuration > 0 ? coveredTo / totalDuration : 1;
+
+    if (coverage < 0.85) {
+      // The transcript stopped early, so any line past that point is guessed
+      // rather than aligned. Say so instead of quietly returning bad cuts.
+      warnings.push(
+        `Speech was only recognized up to ${coveredTo.toFixed(0)}s of ${totalDuration.toFixed(0)}s ` +
+          `(${Math.round(coverage * 100)}%). Lines after that point are estimated, not aligned.`
+      );
+      if (onProgress) onProgress(warnings[warnings.length - 1]);
+    } else if (onProgress) {
+      const weak = lastUnanchoredLines;
+      if (weak.length > 0) {
+        const shown = weak.slice(0, 12).join(', ');
+        onProgress(
+          `Alignment complete: ${words.length} words matched across ${coveredTo.toFixed(0)}s. ` +
+            `Line${weak.length > 1 ? 's' : ''} ${shown}${weak.length > 12 ? '...' : ''} had no clear word match and were estimated.`,
+          100
+        );
+        warnings.push(`Estimated (not word-matched) lines: ${shown}${weak.length > 12 ? '...' : ''}`);
+      } else {
+        onProgress(
+          `Alignment complete: ${words.length} words matched across ${coveredTo.toFixed(0)}s of audio.`,
+          100
+        );
+      }
+    }
 
     return {
       timestamps,
