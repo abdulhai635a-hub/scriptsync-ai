@@ -254,8 +254,18 @@ app.post("/api/align-audio", async (req, res) => {
 
     const whisperXUrl = process.env.WHISPERX_SERVER_URL;
 
+    console.log("[align-audio] request received:", {
+      hasAudioData: !!audioData,
+      audioDataLen: audioData ? String(audioData).length : 0,
+      mimeType,
+      linesCount: scriptLines.length,
+      totalDuration,
+      whisperXUrlConfigured: !!whisperXUrl
+    });
+
     // No audio, or the WhisperX server isn't configured: go straight to the deterministic fallback.
     if (!audioData || !whisperXUrl) {
+      console.log("[align-audio] skipping WhisperX (no audioData or no URL), using proportional fallback");
       const timestamps = computeProportionalTimestamps(scriptLines, dur);
       return res.json({ 
         timestamps, 
@@ -268,8 +278,9 @@ app.post("/api/align-audio", async (req, res) => {
 
     // Real-time forced alignment via your own WhisperX server (replaces Gemini-based guessing).
     try {
+      console.log("[align-audio] calling WhisperX server at", whisperXUrl);
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 45000); // generous timeout for free CPU tiers
+      const timeoutId = setTimeout(() => controller.abort(), 90000); // generous timeout for free CPU tiers (cold start + inference)
 
       const whisperResponse = await fetch(whisperXUrl, {
         method: "POST",
@@ -279,18 +290,22 @@ app.post("/api/align-audio", async (req, res) => {
         },
         body: JSON.stringify({
           audioData,
+          mimeType,
           scriptLines
         }),
         signal: controller.signal
       }).finally(() => clearTimeout(timeoutId));
 
+      console.log("[align-audio] WhisperX response status:", whisperResponse.status);
+
       if (whisperResponse.ok) {
         const whisperResult: any = await whisperResponse.json();
+        console.log("[align-audio] WhisperX result method:", whisperResult.method, "timestamps count:", whisperResult.timestamps?.length, "first:", whisperResult.timestamps?.[0]);
 
         if (Array.isArray(whisperResult.timestamps) && whisperResult.timestamps.length === totalLinesCount) {
           return res.json({
             timestamps: whisperResult.timestamps,
-            method: "whisperx-real",
+            method: whisperResult.method || "whisperx-real",
             totalLines: totalLinesCount,
             audioDuration: dur,
             warnings
@@ -299,6 +314,8 @@ app.post("/api/align-audio", async (req, res) => {
 
         warnings.push("WhisperX server returned an unexpected number of timestamps; used proportional fallback.");
       } else {
+        const bodyText = await whisperResponse.text().catch(() => "");
+        console.log("[align-audio] WhisperX error body:", bodyText.slice(0, 500));
         warnings.push(`WhisperX server responded with status ${whisperResponse.status}; used proportional fallback.`);
       }
     } catch (whisperErr: any) {
