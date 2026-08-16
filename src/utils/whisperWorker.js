@@ -70,52 +70,13 @@ function countWords(chunks) {
   return n;
 }
 
-async function transcribeWindow(model, audioSlice) {
+async function transcribeWindow(model, audioSlice, extra) {
   try {
-    const out = await model(audioSlice, { return_timestamps: 'word' });
+    const out = await model(audioSlice, { return_timestamps: 'word', ...(extra || {}) });
     return out?.chunks || [];
   } catch (e) {
     return [];
   }
-}
-
-/**
- * Bring a window to a consistent loudness before recognition.
- *
- * A passage that is simply quieter than the rest is the classic cause of
- * Whisper returning almost nothing for it. Normalising the track as a whole
- * can't fix that, because the loud passages set the scale and the quiet one
- * stays quiet. Normalising each window on its own does.
- *
- * The target is RMS rather than peak: peak normalisation is thrown off by a
- * single click or breath, and pushing a whole window to full scale distorts it.
- * Whisper behaves best around an RMS of 0.05-0.25.
- */
-function normaliseWindow(slice, targetRms = 0.12, maxGain = 15) {
-  let sumSq = 0;
-  let peak = 0;
-  for (let i = 0; i < slice.length; i++) {
-    const v = slice[i];
-    const a = v < 0 ? -v : v;
-    if (a > peak) peak = a;
-    sumSq += v * v;
-  }
-  if (peak < 1e-6) return slice; // silence: nothing to lift
-
-  const rms = Math.sqrt(sumSq / slice.length);
-  if (rms < 1e-7) return slice;
-
-  let gain = Math.min(maxGain, targetRms / rms);
-  if (gain <= 1.01) return slice; // already loud enough
-
-  const out = new Float32Array(slice.length);
-  for (let i = 0; i < slice.length; i++) {
-    let v = slice[i] * gain;
-    if (v > 1) v = 1;
-    else if (v < -1) v = -1;
-    out[i] = v;
-  }
-  return out;
 }
 
 self.onmessage = async (event) => {
@@ -160,22 +121,21 @@ self.onmessage = async (event) => {
         pct: 32 + (from / totalSec) * 55
       });
 
-      // Normalise each window on its own rather than the track as a whole.
-      // A passage that is simply quieter than the rest is the classic cause of
-      // Whisper returning almost nothing for it — global normalisation can't
-      // help because the loud parts set the scale. Per-window gain puts every
-      // stretch at a level the model can actually hear.
-      const boosted = normaliseWindow(slice);
+      // Feed the audio through unchanged.
+      //
+      // Boosting quiet windows was tried and made things measurably worse: the
+      // stretches that transcribe poorly are quiet *because* speech there sits
+      // under music or noise, and raising the gain lifts that interference
+      // just as much as the voice. Whisper's own feature extractor already
+      // normalises its input, so there is nothing to gain here anyway.
+      let chunks = await transcribeWindow(model, slice);
 
-      let chunks = await transcribeWindow(model, boosted);
-
-      // If a window comes back implausibly sparse for its length, the audio was
-      // probably still too quiet or too noisy. Retry once with a harder gain
-      // before accepting that there is nothing there.
+      // A window that comes back implausibly sparse is retried once. Whisper's
+      // decoding is not deterministic under a different temperature, so a
+      // second attempt sometimes recovers speech the first pass gave up on.
       const spokenSec = to - from;
       if (countWords(chunks) < spokenSec / 4) {
-        const harder = normaliseWindow(slice, 0.22, 40);
-        const retry = await transcribeWindow(model, harder);
+        const retry = await transcribeWindow(model, slice, { temperature: 0.2 });
         if (countWords(retry) > countWords(chunks)) chunks = retry;
       }
 
