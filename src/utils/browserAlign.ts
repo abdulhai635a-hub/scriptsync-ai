@@ -106,6 +106,7 @@ export async function transcribeInBrowser(
       if (data.type === 'progress') {
         if (onProgress) onProgress(data.message, data.pct >= 0 ? data.pct : undefined);
       } else if (data.type === 'done') {
+        lastTranscriptHoles = data.holes || [];
         finish(() => resolve(data.words || []));
       } else if (data.type === 'error') {
         finish(() => reject(new Error(data.message || 'Transcription failed')));
@@ -253,6 +254,9 @@ export let lastUnanchoredReport: string = '';
 
 /** Clips whose duration far exceeds what their text should take to say. */
 export let lastOverlongLines: string[] = [];
+
+/** Stretches of audio where no speech was transcribed at all. */
+export let lastTranscriptHoles: string[] = [];
 
 /**
  * Turn word-level timestamps into per-line timestamps.
@@ -729,6 +733,11 @@ export async function alignInBrowser(
       }
       if (lastOverlongLines.length > 0) {
         warnings.push(`Over-long clips (audio not covered by script): ${lastOverlongLines.slice(0, 5).join('; ')}`);
+      }
+      if (lastTranscriptHoles.length > 0) {
+        warnings.push(
+          `No speech transcribed in: ${lastTranscriptHoles.slice(0, 6).join(', ')} — lines covering those times can't be aligned.`
+        );
       }
     }
 
