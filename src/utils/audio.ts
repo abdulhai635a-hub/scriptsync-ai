@@ -364,6 +364,34 @@ export async function alignAudioWithScript(
     onProgress(`Analyzing spoken dialogue across all ${lineCount} script lines...`);
   }
 
+  // Primary path: transcribe locally in the browser and align with real word
+  // timestamps. This avoids free-tier server limits entirely (no cold starts,
+  // no RAM/CPU ceiling, no upload of large audio) and handles long files.
+  try {
+    const { alignInBrowser } = await import('./browserAlign');
+    const browserResult = await alignInBrowser(
+      audioFileOrBlob,
+      scriptLines,
+      totalDuration,
+      (msg) => {
+        if (onProgress) onProgress(msg);
+      }
+    );
+
+    if (
+      browserResult.method === 'browser-whisper-aligned' &&
+      browserResult.timestamps.length === lineCount
+    ) {
+      return {
+        timestamps: browserResult.timestamps,
+        warnings: browserResult.warnings,
+        method: browserResult.method
+      };
+    }
+  } catch (browserErr) {
+    console.log('Browser alignment unavailable, trying server:', browserErr);
+  }
+
   try {
     // Read audio as base64 for Gemini multimodal analysis
     const base64Data = await new Promise<string>((resolve, reject) => {
