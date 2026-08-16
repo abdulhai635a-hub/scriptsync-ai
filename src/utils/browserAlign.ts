@@ -258,6 +258,12 @@ export let lastOverlongLines: string[] = [];
 /** Stretches of audio where no speech was transcribed at all. */
 export let lastTranscriptHoles: string[] = [];
 
+/** Where each line's last actually-matched word ends. Trimming must never cut before this. */
+export let lastSpeechEnd: number[] = [];
+
+/** Fraction of each line's words that found a match, for spotting script/audio divergence. */
+export let lastMatchRatio: number[] = [];
+
 /**
  * Turn word-level timestamps into per-line timestamps.
  * Guarantees: exactly one entry per script line, non-overlapping, in order,
@@ -378,6 +384,15 @@ export function alignWordsToLines(
     if ((rawStart[i] as number) < lastEnd) rawStart[i] = lastEnd;
     if ((rawEnd[i] as number) < (rawStart[i] as number)) rawEnd[i] = rawStart[i];
     lastEnd = rawEnd[i] as number;
+  }
+
+  // Expose per-line speech extent and match quality
+  lastSpeechEnd = new Array(lineCount).fill(0);
+  lastMatchRatio = new Array(lineCount).fill(0);
+  for (let i = 0; i < lineCount; i++) {
+    lastSpeechEnd[i] = rawEnd[i] === null ? 0 : (rawEnd[i] as number);
+    const wc = wordCountOf(i);
+    lastMatchRatio[i] = wc > 0 ? Math.min(1, perLine[i].length / wc) : 0;
   }
 
   // Record which lines had no real word match, so callers can report them
@@ -692,12 +707,21 @@ export async function alignInBrowser(
         ? perWord[perWord.length >> 1]
         : 0.4;
 
-      timestamps = timestamps.map((r) => {
+      timestamps = timestamps.map((r, i) => {
         const t = String(r.text || '').trim();
         const wc = t ? t.split(/\s+/).length : 1;
         const cap = Math.max(0.5, wc * rate * 1.6);
-        if (r.duration <= cap) return r;
-        const end = Number((r.startTime + cap).toFixed(2));
+
+        // Never cut into speech that actually matched this line. Trimming is
+        // meant to discard audio no line accounts for; applying a blanket
+        // length cap also chops the tail off lines that are simply delivered
+        // slowly, which cuts real words mid-sentence.
+        const speechEnd = lastSpeechEnd[i] || 0;
+        const floor = speechEnd > r.startTime ? speechEnd - r.startTime + 0.25 : 0;
+        const effectiveCap = Math.max(cap, floor);
+
+        if (r.duration <= effectiveCap) return r;
+        const end = Number((r.startTime + effectiveCap).toFixed(2));
         return { ...r, endTime: end, duration: Number((end - r.startTime).toFixed(2)) };
       });
       warnings.push('Trimmed audio that matched no script line.');
@@ -738,6 +762,16 @@ export async function alignInBrowser(
         warnings.push(
           `No speech transcribed in: ${lastTranscriptHoles.slice(0, 6).join(', ')} — lines covering those times can't be aligned.`
         );
+      }
+      // Lines that are anchored but only weakly: these are where the script
+      // and the narration most likely diverge, and they look like "wrong cuts"
+      // even though the aligner did the best the transcript allowed.
+      const weakMatches: string[] = [];
+      lastMatchRatio.forEach((ratio, i) => {
+        if (ratio < 0.34) weakMatches.push(`${scriptLines[i]?.num ?? i + 1}`);
+      });
+      if (weakMatches.length > 0) {
+        warnings.push(`Weakly matched lines (script may differ from audio): ${weakMatches.slice(0, 12).join(', ')}`);
       }
     }
 
