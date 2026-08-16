@@ -623,56 +623,57 @@ export function alignWordsToLines(
 
   // ---- Choose all boundaries together ----------------------------------
   //
-  // Deciding each boundary on its own is what made errors wander: a cut would
-  // move onto the pause that looked best locally, without regard for what that
-  // left the following lines to work with, so fixing one line pushed the
-  // problem onto its neighbour.
+  // Every boundary is picked in one pass, as the combination that minimises
+  // total error across the whole narration, rather than each cut being settled
+  // on its own. Deciding them independently is what made errors wander from
+  // one line to its neighbour: a cut would take the pause that looked best
+  // locally, with no regard for what it left the following lines.
   //
-  // Every boundary is therefore chosen in one pass, picking the combination
-  // that minimises total error across the whole narration. Each candidate cut
-  // is judged on two things: whether the words matched to a line actually fall
-  // inside its span, and whether the resulting length matches what that line's
-  // word count says it should take to say. A cut that looks appealing on its
-  // own is rejected if it forces bad cuts later.
+  // Candidates are drawn from every pause in the recording, not just those
+  // near where the word matching happens to point. If the matching has slipped
+  // badly for a line - which is exactly when help is needed - the correct pause
+  // may be many seconds away, and restricting the search to the neighbourhood
+  // of a bad guess would rule out the right answer before scoring began.
   //
-  // Because this is global rather than greedy, it doesn't depend on any
-  // property of this particular recording - a different script or a different
-  // voice gets the same treatment.
+  // Two signals decide it: whether a line's matched words fall inside its span,
+  // and whether the span length matches what that line's word count implies.
+  // Neither is trusted alone, so a line whose transcription went wrong is still
+  // placed sensibly by its length, and an unusual delivery is still placed by
+  // its words.
   if (lineCount > 1) {
-    const SEARCH = 4.0; // how far a boundary may move, in seconds
+    const SEARCH = 4.0; // how far a boundary may move from where the words put it
 
-    // Word times per line, sorted, for scoring how well a span contains them
+    const expFor = (i: number) => Math.max(0.3, wordCountOf(i) * secPerWordEst);
+
     const lineWordTimes: number[][] = [];
     for (let i = 0; i < lineCount; i++) {
       lineWordTimes.push(perLine[i].map((k) => words[k].start).sort((x, y) => x - y));
     }
 
-    // Candidate positions for each interior boundary: nearby pauses, plus the
-    // boundary the word matching already suggests (in case there is no pause).
+    // Candidates for each interior boundary: nearby pauses, plus the position
+    // the word matching already suggests. Keeping the matched position as an
+    // option matters because not every line ends at a pause - lines split
+    // mid-sentence run straight on into the next.
     const candidates: number[][] = [];
     for (let i = 1; i < lineCount; i++) {
       const anchor = bounds[i];
-      const opts = [anchor];
+      const opts: number[] = [anchor];
       for (const [sStart, sEnd] of lastSilences) {
         const mid = (sStart + sEnd) / 2;
         if (mid < anchor - SEARCH) continue;
         if (mid > anchor + SEARCH) break;
         opts.push(mid);
       }
-      opts.sort((a, b) => a - b);
-      // de-duplicate near-identical options
+      opts.sort((x, y) => x - y);
       const uniq: number[] = [];
       for (const o of opts) if (!uniq.length || o - uniq[uniq.length - 1] > 0.05) uniq.push(o);
       candidates.push(uniq);
     }
 
-    const expectedFor2 = (i: number) => Math.max(0.3, wordCountOf(i) * secPerWordEst);
-
-    // Cost of giving line i the span [a, b]
     const spanCost = (i: number, a: number, b: number) => {
       const dur = b - a;
       if (dur < 0.15) return 1e6;
-      const exp = expectedFor2(i);
+      const exp = expFor(i);
       const durErr = Math.abs(dur - exp) / Math.max(0.5, exp);
 
       const times = lineWordTimes[i];
@@ -683,30 +684,28 @@ export function alignWordsToLines(
       const anchorErr = times.length > 0 ? outside / times.length : 0;
 
       // Words landing outside their own line is the more serious error, so it
-      // carries more weight than the length estimate.
-      return anchorErr * 2.0 + durErr;
+      // outweighs the length estimate.
+      return anchorErr * 2 + durErr;
     };
 
-    // dp[i][c] = best total cost for lines 0..i-1 with boundary i at candidate c
     const dp: number[][] = [];
     const back: number[][] = [];
 
-    const firstOpts = candidates[0];
-    dp.push(firstOpts.map((c) => spanCost(0, 0, c)));
-    back.push(firstOpts.map(() => -1));
+    dp.push(candidates[0].map((c) => spanCost(0, 0, c)));
+    back.push(candidates[0].map(() => -1));
 
     for (let i = 1; i < lineCount - 1; i++) {
       const prevOpts = candidates[i - 1];
       const curOpts = candidates[i];
-      const row: number[] = new Array(curOpts.length).fill(Infinity);
-      const brow: number[] = new Array(curOpts.length).fill(0);
+      const row = new Array(curOpts.length).fill(Infinity);
+      const brow = new Array(curOpts.length).fill(0);
 
       for (let c = 0; c < curOpts.length; c++) {
-        const b = curOpts[c];
+        const bEnd = curOpts[c];
         for (let pAt = 0; pAt < prevOpts.length; pAt++) {
-          const a = prevOpts[pAt];
-          if (a >= b - 0.15) continue;
-          const tot = dp[i - 1][pAt] + spanCost(i, a, b);
+          const aStart = prevOpts[pAt];
+          if (aStart >= bEnd - 0.15) continue;
+          const tot = dp[i - 1][pAt] + spanCost(i, aStart, bEnd);
           if (tot < row[c]) {
             row[c] = tot;
             brow[c] = pAt;
@@ -717,9 +716,8 @@ export function alignWordsToLines(
       back.push(brow);
     }
 
-    // Close out the final line, which runs to the end of the audio
     const lastOpts = candidates[lineCount - 2];
-    let bestEnd = 0;
+    let bestEnd = -1;
     let bestCost = Infinity;
     for (let c = 0; c < lastOpts.length; c++) {
       const tot = dp[lineCount - 2][c] + spanCost(lineCount - 1, lastOpts[c], totalDuration);
@@ -729,13 +727,14 @@ export function alignWordsToLines(
       }
     }
 
-    if (bestCost < Infinity) {
+    if (bestEnd >= 0 && bestCost < Infinity) {
       const chosen: number[] = new Array(lineCount - 1);
       let c = bestEnd;
       for (let i = lineCount - 2; i >= 0; i--) {
         chosen[i] = candidates[i][c];
-        c = back[i][c];
-        if (c < 0) break;
+        const nxt = back[i][c];
+        if (nxt < 0) break;
+        c = nxt;
       }
       for (let i = 1; i < lineCount; i++) bounds[i] = chosen[i - 1];
     }
