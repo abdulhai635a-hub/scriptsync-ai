@@ -139,7 +139,14 @@ self.onmessage = async (event) => {
         if (countWords(retry) > countWords(chunks)) chunks = retry;
       }
 
-      const lastEnd = words.length ? words[words.length - 1].end : -1;
+      // Deduplicate on START time, not END.
+      //
+      // Whisper often reports the final word of a chunk as running all the way
+      // to the chunk boundary. Comparing against that inflated end makes the
+      // next window's genuine words look like duplicates, and they get thrown
+      // away - which is how a whole stretch of ordinary speech can vanish.
+      // Start times are monotonic and trustworthy, so they are used instead.
+      const lastStart = words.length ? words[words.length - 1].start : -Infinity;
 
       for (const c of chunks) {
         const ts = c?.timestamp;
@@ -153,13 +160,88 @@ self.onmessage = async (event) => {
         const end = (typeof e0 === 'number' && e0 > s0 ? e0 : s0 + 0.15) + from;
 
         // Skip words already captured by the previous window's overlap
-        if (start <= lastEnd - 0.05) continue;
+        if (start <= lastStart + 0.02) continue;
 
-        words.push({ word: text, start, end });
+        // No single spoken word lasts seconds; cap it so one bad timestamp
+        // can't stretch across the rest of the track.
+        const safeEnd = Math.min(end, start + 3);
+
+        words.push({ word: text, start, end: safeEnd });
       }
     }
 
     words.sort((a, b) => a.start - b.start);
+
+    // ---- Gap repair -------------------------------------------------------
+    // Any stretch left with no words gets a second attempt on its own. The
+    // audio there is usually perfectly ordinary speech that the first pass
+    // happened to miss, and re-running it with a completely different framing
+    // (the gap centred in its own window rather than straddling a boundary)
+    // normally recovers it. This runs whatever caused the gap, so it doesn't
+    // depend on correctly guessing why the first pass failed.
+    const findGaps = () => {
+      const out = [];
+      for (let i = 1; i < words.length; i++) {
+        const gap = words[i].start - words[i - 1].end;
+        if (gap > 3) out.push([words[i - 1].end, words[i].start]);
+      }
+      if (words.length && words[0].start > 3) out.unshift([0, words[0].start]);
+      const tail = totalSec - (words.length ? words[words.length - 1].end : 0);
+      if (tail > 3) out.push([words.length ? words[words.length - 1].end : 0, totalSec]);
+      return out;
+    };
+
+    const gaps = findGaps();
+    if (gaps.length > 0) {
+      post('progress', { message: `Re-checking ${gaps.length} unclear section(s)...`, pct: 88 });
+
+      const recovered = [];
+      for (const [gStart, gEnd] of gaps) {
+        // Pad either side so words on the edges aren't clipped, and cap the
+        // slice at Whisper's native length.
+        let from = Math.max(0, gStart - 2);
+        let to = Math.min(totalSec, gEnd + 2);
+
+        while (from < to) {
+          const sliceEnd = Math.min(to, from + WINDOW_S);
+          const slice = audio.subarray(
+            Math.floor(from * SAMPLE_RATE),
+            Math.floor(sliceEnd * SAMPLE_RATE)
+          );
+          if (slice.length < SAMPLE_RATE * 0.3) break;
+
+          const chunks = await transcribeWindow(model, slice);
+          for (const c of chunks) {
+            const ts = c?.timestamp;
+            const text = String(c?.text ?? '').trim();
+            if (!text) continue;
+            const s0 = Array.isArray(ts) ? ts[0] : undefined;
+            const e0 = Array.isArray(ts) ? ts[1] : undefined;
+            if (typeof s0 !== 'number') continue;
+            const st = s0 + from;
+            const en = Math.min((typeof e0 === 'number' && e0 > s0 ? e0 : s0 + 0.15) + from, st + 3);
+            // Only keep what actually falls inside the gap we're repairing
+            if (st >= gStart - 0.3 && st <= gEnd + 0.3) recovered.push({ word: text, start: st, end: en });
+          }
+
+          if (sliceEnd >= to) break;
+          from += WINDOW_S - OVERLAP_S;
+        }
+      }
+
+      if (recovered.length > 0) {
+        words.push(...recovered);
+        words.sort((a, b) => a.start - b.start);
+        // Drop anything that ended up on top of an existing word
+        const merged = [];
+        for (const w of words) {
+          if (merged.length && w.start <= merged[merged.length - 1].start + 0.02) continue;
+          merged.push(w);
+        }
+        words.length = 0;
+        words.push(...merged);
+      }
+    }
 
     if (words.length === 0) {
       throw new Error('No speech was recognized in this audio.');
