@@ -278,27 +278,62 @@ app.post("/api/align-audio", async (req, res) => {
 
     // Real-time forced alignment via your own WhisperX server (replaces Gemini-based guessing).
     try {
-      console.log("[align-audio] calling WhisperX server at", whisperXUrl);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 90000); // generous timeout for free CPU tiers (cold start + inference)
+      // --- Wake-up preflight: free-tier hosts return an immediate 502 while spinning up
+      // from sleep (they don't queue the request). Ping /health first and wait for it to
+      // respond OK before sending the (large, slow) real alignment request. ---
+      const healthUrl = whisperXUrl.replace(/\/align\/?$/, "/health");
+      console.log("[align-audio] waking WhisperX server via", healthUrl);
+      let awake = false;
+      for (let attempt = 0; attempt < 8 && !awake; attempt++) {
+        try {
+          const wakeController = new AbortController();
+          const wakeTimeout = setTimeout(() => wakeController.abort(), 10000);
+          const wakeResp = await fetch(healthUrl, { signal: wakeController.signal }).finally(() => clearTimeout(wakeTimeout));
+          if (wakeResp.ok) {
+            awake = true;
+            console.log("[align-audio] WhisperX server is awake (attempt", attempt + 1, ")");
+          }
+        } catch (wakeErr: any) {
+          console.log("[align-audio] wake attempt", attempt + 1, "failed:", wakeErr?.message || wakeErr);
+        }
+        if (!awake) await new Promise((r) => setTimeout(r, 10000));
+      }
 
-      const whisperResponse = await fetch(whisperXUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(process.env.WHISPERX_API_KEY ? { "X-API-KEY": process.env.WHISPERX_API_KEY } : {})
-        },
-        body: JSON.stringify({
-          audioData,
-          mimeType,
-          scriptLines
-        }),
-        signal: controller.signal
-      }).finally(() => clearTimeout(timeoutId));
+      console.log("[align-audio] calling WhisperX server at", whisperXUrl, "(audio ~", Math.round(dur), "s,", totalLinesCount, "lines)");
 
-      console.log("[align-audio] WhisperX response status:", whisperResponse.status);
+      // Long audio takes real time to transcribe on a free CPU tier — allow up to 4 minutes,
+      // and retry once more if we still hit a 502/503 (host still settling after wake-up).
+      let whisperResponse: Response | null = null;
+      let lastStatus = 0;
+      for (let callAttempt = 0; callAttempt < 2; callAttempt++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 240000);
+        try {
+          whisperResponse = await fetch(whisperXUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(process.env.WHISPERX_API_KEY ? { "X-API-KEY": process.env.WHISPERX_API_KEY } : {})
+            },
+            body: JSON.stringify({
+              audioData,
+              mimeType,
+              scriptLines
+            }),
+            signal: controller.signal
+          });
+        } finally {
+          clearTimeout(timeoutId);
+        }
 
-      if (whisperResponse.ok) {
+        lastStatus = whisperResponse.status;
+        console.log("[align-audio] WhisperX response status:", lastStatus, "(call attempt", callAttempt + 1, ")");
+
+        if (lastStatus !== 502 && lastStatus !== 503) break; // only retry on "still waking up" style errors
+        await new Promise((r) => setTimeout(r, 8000));
+      }
+
+      if (whisperResponse && whisperResponse.ok) {
         const whisperResult: any = await whisperResponse.json();
         console.log("[align-audio] WhisperX result method:", whisperResult.method, "timestamps count:", whisperResult.timestamps?.length, "first:", whisperResult.timestamps?.[0]);
 
@@ -313,7 +348,7 @@ app.post("/api/align-audio", async (req, res) => {
         }
 
         warnings.push("WhisperX server returned an unexpected number of timestamps; used proportional fallback.");
-      } else {
+      } else if (whisperResponse) {
         const bodyText = await whisperResponse.text().catch(() => "");
         console.log("[align-audio] WhisperX error body:", bodyText.slice(0, 500));
         warnings.push(`WhisperX server responded with status ${whisperResponse.status}; used proportional fallback.`);
