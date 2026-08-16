@@ -349,7 +349,7 @@ export default function App() {
         }
 
         setAudioMap(nextAudioMap);
-        const warningMsg = alignment.warnings && alignment.warnings.length > 0 ? ` (${alignment.warnings[0]})` : '';
+        const warningMsg = alignment.warnings && alignment.warnings.length > 0 ? ` (${alignment.warnings.join(' | ')})` : '';
         setSyncStatus(`Auto-sliced narration into ${scriptLines.length} segments across ${totalDur.toFixed(1)}s audio${warningMsg}`);
       } catch (err) {
         console.log('Audio slice failed:', err);

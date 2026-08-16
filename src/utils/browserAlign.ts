@@ -248,6 +248,9 @@ function alignSequences(scriptWords: string[], asrWords: string[]): number[] {
 /** Lines from the most recent alignWordsToLines call that had no real word match. */
 export let lastUnanchoredLines: number[] = [];
 
+/** What the transcript actually contained around the unmatched lines, for diagnosis. */
+export let lastUnanchoredReport: string = '';
+
 /**
  * Turn word-level timestamps into per-line timestamps.
  * Guarantees: exactly one entry per script line, non-overlapping, in order,
@@ -314,6 +317,44 @@ export function alignWordsToLines(
   }
   lastUnanchoredLines = unanchored;
 
+  // For the unmatched run, capture what the transcript actually says in that
+  // stretch of audio next to what the script says. If these turn out to be
+  // completely different content, no aligner can match them and the script
+  // itself is the thing to look at.
+  lastUnanchoredReport = '';
+  if (unanchored.length > 0) {
+    const firstIdx = scriptLines.findIndex((l, i) => rawStart[i] === null);
+    let lastIdx = firstIdx;
+    for (let i = firstIdx; i < lineCount; i++) if (rawStart[i] === null) lastIdx = i;
+
+    // Time window: between the last anchored line before, and first anchored after
+    let prev = firstIdx - 1;
+    while (prev >= 0 && rawEnd[prev] === null) prev--;
+    let next = lastIdx + 1;
+    while (next < lineCount && rawStart[next] === null) next++;
+
+    const from = prev >= 0 ? (rawEnd[prev] as number) : 0;
+    const to = next < lineCount ? (rawStart[next] as number) : totalDuration;
+
+    const heard = words
+      .filter((w) => w.start >= from - 0.5 && w.end <= to + 0.5)
+      .map((w) => w.word)
+      .join(' ')
+      .trim();
+
+    const scriptSaid = scriptLines
+      .slice(firstIdx, lastIdx + 1)
+      .map((l) => l.text)
+      .join(' ')
+      .trim();
+
+    lastUnanchoredReport =
+      `Window ${from.toFixed(1)}s-${to.toFixed(1)}s | ` +
+      `SCRIPT SAYS: "${scriptSaid.slice(0, 300)}" | ` +
+      `AUDIO HEARD: "${heard.slice(0, 300) || '(nothing recognized)'}"`;
+    console.log('[browserAlign] unmatched region ->', lastUnanchoredReport);
+  }
+
   // Interpolate lines that matched nothing, using the nearest anchored lines.
   // The gap is shared out in proportion to how much each line actually says,
   // rather than evenly: a 20-word line and a 3-word line should not get the
@@ -350,21 +391,49 @@ export function alignWordsToLines(
     rawEnd[i] = from + (span * (before + lineWeight(i))) / totalWeight;
   }
 
-  // Enforce monotonic, non-overlapping, in-range boundaries
+  // Enforce monotonic, non-overlapping, in-range boundaries.
+  //
+  // The segments must also be CONTIGUOUS: the app slices audio from startTime
+  // to endTime and lays the slices end to end, so any audio falling between
+  // one line's end and the next line's start is thrown away. That is the
+  // natural pause between sentences — losing it makes every line run straight
+  // into the next. So each boundary is placed inside the pause rather than at
+  // the last word: the silence stays with the line it follows, and the next
+  // line gets a small lead-in so its first word isn't clipped.
+  const LEAD_IN = 0.15;
+
+  const bounds: number[] = new Array(lineCount + 1);
+  bounds[0] = 0;
+  bounds[lineCount] = totalDuration;
+
+  for (let i = 0; i < lineCount - 1; i++) {
+    const thisEnd = rawEnd[i] as number;
+    const nextStart = rawStart[i + 1] as number;
+    const gap = nextStart - thisEnd;
+
+    let boundary: number;
+    if (gap > 0) {
+      // Keep most of the pause with the current line, leave a lead-in for the next
+      boundary = nextStart - Math.min(LEAD_IN, gap / 2);
+    } else {
+      // Words overlap or touch: fall back to the midpoint
+      boundary = Math.max(thisEnd, nextStart);
+    }
+    bounds[i + 1] = boundary;
+  }
+
+  // Make boundaries strictly increasing and inside the audio
+  for (let i = 1; i <= lineCount; i++) {
+    const minAllowed = bounds[i - 1] + 0.15;
+    const maxAllowed = totalDuration - (lineCount - i) * 0.15;
+    bounds[i] = Math.min(Math.max(bounds[i], minAllowed), Math.max(minAllowed, maxAllowed));
+  }
+  bounds[lineCount] = totalDuration;
+
   const result: LineStamp[] = [];
-  let cursor = 0;
   for (let i = 0; i < lineCount; i++) {
-    const isLast = i === lineCount - 1;
-    let start = Math.max(cursor, Math.min(totalDuration, rawStart[i] as number));
-    let end = Math.max(start + 0.15, Math.min(totalDuration, rawEnd[i] as number));
-
-    // Reserve a sliver for every remaining line so later lines aren't crushed
-    const remaining = lineCount - 1 - i;
-    const latestAllowedEnd = totalDuration - remaining * 0.15;
-    if (!isLast && end > latestAllowedEnd) end = Math.max(start + 0.15, latestAllowedEnd);
-    if (isLast) end = totalDuration;
-    if (start >= end) start = Math.max(0, end - 0.15);
-
+    const start = bounds[i];
+    const end = bounds[i + 1];
     result.push({
       num: scriptLines[i].num ?? i + 1,
       text: scriptLines[i].text ?? `Line ${i + 1}`,
@@ -372,7 +441,6 @@ export function alignWordsToLines(
       endTime: Number(end.toFixed(2)),
       duration: Number((end - start).toFixed(2))
     });
-    cursor = end;
   }
 
   return result;
@@ -450,6 +518,7 @@ export async function alignInBrowser(
           100
         );
         warnings.push(`Estimated (not word-matched) lines: ${shown}${weak.length > 12 ? '...' : ''}`);
+        if (lastUnanchoredReport) warnings.push(lastUnanchoredReport);
       } else {
         onProgress(
           `Alignment complete: ${words.length} words matched across ${coveredTo.toFixed(0)}s of audio.`,
