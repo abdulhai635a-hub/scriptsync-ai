@@ -355,7 +355,8 @@ export async function alignAudioWithScript(
   audioFileOrBlob: File | Blob,
   scriptLines: Array<{ num: number; text: string }>,
   totalDuration: number,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  trimUnmatchedAudio = true
 ): Promise<AlignmentResult> {
   const lineCount = scriptLines.length;
   if (lineCount === 0) return { timestamps: [], warnings: [] };
@@ -375,7 +376,8 @@ export async function alignAudioWithScript(
       totalDuration,
       (msg) => {
         if (onProgress) onProgress(msg);
-      }
+      },
+      trimUnmatchedAudio
     );
 
     if (

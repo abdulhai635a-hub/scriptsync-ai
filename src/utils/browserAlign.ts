@@ -251,6 +251,9 @@ export let lastUnanchoredLines: number[] = [];
 /** What the transcript actually contained around the unmatched lines, for diagnosis. */
 export let lastUnanchoredReport: string = '';
 
+/** Clips whose duration far exceeds what their text should take to say. */
+export let lastOverlongLines: string[] = [];
+
 /**
  * Turn word-level timestamps into per-line timestamps.
  * Guarantees: exactly one entry per script line, non-overlapping, in order,
@@ -297,17 +300,80 @@ export function alignWordsToLines(
     if (asrIdx >= 0) perLine[flat[k].lineIndex].push(asrIdx);
   }
 
-  // Raw start/end per line from matched words
+  // Raw start/end per line from matched words.
+  //
+  // Taking the plain min/max of every matched index is fragile: where part of
+  // the script has no corresponding audio, the aligner can attach a stray word
+  // far down the timeline, and that single match stretches the line across
+  // everything in between — squeezing all the following lines into what's
+  // left. So each line's matches are first summarised robustly (median), then
+  // matches far outside a plausible speaking window for that line are dropped.
   const rawStart = new Array<number | null>(lineCount).fill(null);
   const rawEnd = new Array<number | null>(lineCount).fill(null);
+
+  const median = (arr: number[]) => {
+    if (arr.length === 0) return 0;
+    const s = [...arr].sort((a, b) => a - b);
+    const mid = s.length >> 1;
+    return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  };
+
+  const wordCountOf = (i: number) => {
+    const t = String(scriptLines[i].text || '').trim();
+    return t ? t.split(/\s+/).length : 1;
+  };
+
+  // Pass 1: rough spans, then a robust per-word speaking rate (median resists
+  // the very outliers we're trying to remove).
+  const rates: number[] = [];
   for (let i = 0; i < lineCount; i++) {
     const idxs = perLine[i];
-    if (idxs.length > 0) {
-      const first = Math.min(...idxs);
-      const last = Math.max(...idxs);
-      rawStart[i] = words[first].start;
-      rawEnd[i] = words[last].end;
+    if (idxs.length < 2) continue;
+    const times = idxs.map((k) => words[k].start);
+    const span = Math.max(...times) - Math.min(...times);
+    const wc = wordCountOf(i);
+    if (span > 0 && wc > 0) rates.push(span / wc);
+  }
+  const secPerWordEst = rates.length > 0 ? median(rates) : 0.4;
+
+  // Pass 2: keep only the tightest cluster of matches for each line.
+  // Falling back to "keep everything" when the matches are scattered would
+  // reinstate exactly the stray anchor we're trying to remove, so instead the
+  // densest window of plausible width wins and the rest are discarded.
+  for (let i = 0; i < lineCount; i++) {
+    const idxs = perLine[i];
+    if (idxs.length === 0) continue;
+
+    const allowed = Math.max(3, wordCountOf(i) * secPerWordEst * 2 + 2);
+    const sorted = [...idxs].sort((a, b) => words[a].start - words[b].start);
+
+    // Sliding window: find the run covering the most matches within `allowed`
+    let bestStart = 0;
+    let bestCount = 0;
+    let lo = 0;
+    for (let hi = 0; hi < sorted.length; hi++) {
+      while (words[sorted[hi]].start - words[sorted[lo]].start > allowed) lo++;
+      const count = hi - lo + 1;
+      if (count > bestCount) {
+        bestCount = count;
+        bestStart = lo;
+      }
     }
+
+    const use = sorted.slice(bestStart, bestStart + bestCount);
+    rawStart[i] = words[use[0]].start;
+    rawEnd[i] = words[use[use.length - 1]].end;
+  }
+
+  // Keep the anchored spans in order. Outlier removal is per-line, so a line's
+  // range can still overlap a neighbour's; clamp so later logic sees a sane,
+  // monotonically increasing sequence.
+  let lastEnd = 0;
+  for (let i = 0; i < lineCount; i++) {
+    if (rawStart[i] === null) continue;
+    if ((rawStart[i] as number) < lastEnd) rawStart[i] = lastEnd;
+    if ((rawEnd[i] as number) < (rawStart[i] as number)) rawEnd[i] = rawStart[i];
+    lastEnd = rawEnd[i] as number;
   }
 
   // Record which lines had no real word match, so callers can report them
@@ -393,14 +459,19 @@ export function alignWordsToLines(
 
   // Enforce monotonic, non-overlapping, in-range boundaries.
   //
-  // The segments must also be CONTIGUOUS: the app slices audio from startTime
-  // to endTime and lays the slices end to end, so any audio falling between
-  // one line's end and the next line's start is thrown away. That is the
-  // natural pause between sentences — losing it makes every line run straight
-  // into the next. So each boundary is placed inside the pause rather than at
-  // the last word: the silence stays with the line it follows, and the next
-  // line gets a small lead-in so its first word isn't clipped.
+  // The segments must be CONTIGUOUS: the app slices audio from startTime to
+  // endTime and lays the slices end to end, so anything falling between one
+  // line's end and the next line's start is thrown away. That is the natural
+  // pause between sentences — losing it makes every line run straight into the
+  // next.
+  //
+  // But the pause must not all land on one side either: where a long stretch
+  // of audio matches no script line, giving it entirely to the preceding line
+  // makes that one clip far longer than its text. So short pauses stay mostly
+  // with the line they follow (natural trailing silence), while long ones are
+  // split between the two neighbours.
   const LEAD_IN = 0.15;
+  const NATURAL_TAIL = 1.2; // trailing silence a line keeps outright
 
   const bounds: number[] = new Array(lineCount + 1);
   bounds[0] = 0;
@@ -412,17 +483,79 @@ export function alignWordsToLines(
     const gap = nextStart - thisEnd;
 
     let boundary: number;
-    if (gap > 0) {
-      // Keep most of the pause with the current line, leave a lead-in for the next
+    if (gap <= 0) {
+      boundary = Math.max(thisEnd, nextStart);
+    } else if (gap <= NATURAL_TAIL + LEAD_IN) {
+      // Ordinary sentence pause: keep most of it with the current line
       boundary = nextStart - Math.min(LEAD_IN, gap / 2);
     } else {
-      // Words overlap or touch: fall back to the midpoint
-      boundary = Math.max(thisEnd, nextStart);
+      // Long unmatched stretch: split it so neither clip balloons
+      boundary = thisEnd + NATURAL_TAIL + (gap - NATURAL_TAIL - LEAD_IN) / 2;
     }
     bounds[i + 1] = boundary;
   }
 
   // Make boundaries strictly increasing and inside the audio
+  for (let i = 1; i <= lineCount; i++) {
+    const minAllowed = bounds[i - 1] + 0.15;
+    const maxAllowed = totalDuration - (lineCount - i) * 0.15;
+    bounds[i] = Math.min(Math.max(bounds[i], minAllowed), Math.max(minAllowed, maxAllowed));
+  }
+  bounds[lineCount] = totalDuration;
+
+  // Direct guard against one line swallowing a stretch of audio it can't
+  // account for while its neighbours get slivers.
+  //
+  // Anchoring can go wrong in ways that are hard to predict, so rather than
+  // relying only on the matching being right, this enforces the property that
+  // actually matters: a clip should not be wildly longer than its text takes
+  // to say while the lines around it are compressed. Where that happens, the
+  // excess is handed back to the squeezed neighbours. Lines that already look
+  // reasonable are left untouched.
+  const expectedFor = (i: number) => Math.max(0.3, wordCountOf(i) * secPerWordEst);
+
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < lineCount - 1; i++) {
+      const dur = bounds[i + 1] - bounds[i];
+      const exp = expectedFor(i);
+      if (dur <= exp * 2.5 || dur - exp < 2) continue;
+
+      // How compressed is the run that follows?
+      let j = i + 1;
+      let needed = 0;
+      while (j < lineCount) {
+        const dNext = bounds[j + 1] - bounds[j];
+        const eNext = expectedFor(j);
+        if (dNext >= eNext * 0.75) break;
+        needed += eNext - dNext;
+        j++;
+      }
+      if (needed <= 0) continue;
+
+      // Give back what we can spare without dropping below a sane length
+      const spare = Math.max(0, dur - exp * 1.5);
+      const shift = Math.min(spare, needed);
+      if (shift <= 0.05) continue;
+
+      bounds[i + 1] -= shift;
+      // Re-spread the following squeezed run proportionally to its text
+      const runEnd = j;
+      let weightSum = 0;
+      for (let k = i + 1; k < runEnd; k++) weightSum += expectedFor(k);
+      if (weightSum <= 0) continue;
+
+      const runFrom = bounds[i + 1];
+      const runTo = bounds[runEnd];
+      let cursor = runFrom;
+      for (let k = i + 1; k < runEnd; k++) {
+        const share = ((runTo - runFrom) * expectedFor(k)) / weightSum;
+        bounds[k] = cursor;
+        cursor += share;
+      }
+    }
+  }
+
+  // Re-assert ordering after rebalancing
   for (let i = 1; i <= lineCount; i++) {
     const minAllowed = bounds[i - 1] + 0.15;
     const maxAllowed = totalDuration - (lineCount - i) * 0.15;
@@ -442,6 +575,39 @@ export function alignWordsToLines(
       duration: Number((end - start).toFixed(2))
     });
   }
+
+  // Flag clips far longer than their text implies. That means the audio holds
+  // speech (or silence) no script line accounts for, which is a script/audio
+  // mismatch rather than an alignment error — worth surfacing either way.
+  //
+  // The speaking rate is measured from lines that actually matched words, not
+  // from total duration: unmatched dead air would otherwise inflate the rate
+  // and mask the very problem this is meant to catch.
+  let anchoredSpeech = 0;
+  let anchoredWords = 0;
+  for (let i = 0; i < lineCount; i++) {
+    if (rawStart[i] === null || rawEnd[i] === null) continue;
+    const span = (rawEnd[i] as number) - (rawStart[i] as number);
+    const t = String(scriptLines[i].text || '').trim();
+    const wc = t ? t.split(/\s+/).length : 1;
+    if (span > 0 && wc > 0) {
+      anchoredSpeech += span;
+      anchoredWords += wc;
+    }
+  }
+  const secPerWord = anchoredWords > 0 ? anchoredSpeech / anchoredWords : 0.4;
+
+  lastOverlongLines = [];
+  result.forEach((r, i) => {
+    const t = String(scriptLines[i].text || '').trim();
+    const wc = t ? t.split(/\s+/).length : 1;
+    const expected = wc * secPerWord;
+    if (r.duration > expected * 2 && r.duration - expected > 3) {
+      lastOverlongLines.push(
+        `line ${r.num}: ${r.duration.toFixed(1)}s clip for ~${wc} words (expected ~${expected.toFixed(1)}s)`
+      );
+    }
+  });
 
   return result;
 }
@@ -480,7 +646,13 @@ export async function alignInBrowser(
   file: File | Blob,
   scriptLines: Array<{ num: number; text: string }>,
   totalDuration: number,
-  onProgress?: ProgressFn
+  onProgress?: ProgressFn,
+  // When the audio contains speech no script line accounts for, that time has
+  // to go somewhere. Keeping it (default) preserves every pause but makes the
+  // clips on either side of the hole long. Trimming it caps clip lengths but
+  // drops that audio from the video entirely. Which is right depends on
+  // whether the extra speech is wanted, so it's a choice rather than a rule.
+  trimUnmatchedAudio = true
 ): Promise<{ timestamps: LineStamp[]; method: string; warnings: string[] }> {
   const warnings: string[] = [];
   try {
@@ -495,7 +667,37 @@ export async function alignInBrowser(
       };
     }
 
-    const timestamps = alignWordsToLines(words, scriptLines, totalDuration);
+    let timestamps = alignWordsToLines(words, scriptLines, totalDuration);
+
+    if (trimUnmatchedAudio && lastOverlongLines.length > 0) {
+      // Cut each over-long clip back to a plausible length for its text. The
+      // unmatched audio inside it is dropped rather than kept.
+      //
+      // The rate is the median seconds-per-word across lines: using the total
+      // span would fold the unmatched stretch into the estimate and inflate
+      // the very cap meant to exclude it.
+      const perWord = timestamps
+        .map((r) => {
+          const t = String(r.text || '').trim();
+          const wc = t ? t.split(/\s+/).length : 1;
+          return r.duration / Math.max(1, wc);
+        })
+        .filter((v) => v > 0)
+        .sort((a, b) => a - b);
+      const rate = perWord.length
+        ? perWord[perWord.length >> 1]
+        : 0.4;
+
+      timestamps = timestamps.map((r) => {
+        const t = String(r.text || '').trim();
+        const wc = t ? t.split(/\s+/).length : 1;
+        const cap = Math.max(0.5, wc * rate * 1.6);
+        if (r.duration <= cap) return r;
+        const end = Number((r.startTime + cap).toFixed(2));
+        return { ...r, endTime: end, duration: Number((end - r.startTime).toFixed(2)) };
+      });
+      warnings.push('Trimmed audio that matched no script line.');
+    }
 
     const coveredTo = words[words.length - 1].end;
     const coverage = totalDuration > 0 ? coveredTo / totalDuration : 1;
@@ -524,6 +726,9 @@ export async function alignInBrowser(
           `Alignment complete: ${words.length} words matched across ${coveredTo.toFixed(0)}s of audio.`,
           100
         );
+      }
+      if (lastOverlongLines.length > 0) {
+        warnings.push(`Over-long clips (audio not covered by script): ${lastOverlongLines.slice(0, 5).join('; ')}`);
       }
     }
 
