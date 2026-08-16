@@ -621,54 +621,123 @@ export function alignWordsToLines(
     }
   }
 
-  // ---- Snap boundaries onto real pauses --------------------------------
+  // ---- Choose all boundaries together ----------------------------------
   //
-  // Word matching gets a boundary roughly right, but "roughly" can mean a
-  // whole sentence out when two consecutive lines both end in common words.
-  // The narration itself is a better guide: there is a pause at the end of
-  // nearly every sentence, so the cut belongs in one of those.
+  // Deciding each boundary on its own is what made errors wander: a cut would
+  // move onto the pause that looked best locally, without regard for what that
+  // left the following lines to work with, so fixing one line pushed the
+  // problem onto its neighbour.
   //
-  // Among the pauses near the computed boundary, the chosen one balances two
-  // things - how far it moves the boundary, and how well the resulting clip
-  // lengths match what each line's word count says they should be. That second
-  // term is what rules out an adjacent pause a sentence too late, which would
-  // leave one line overlong and the next one clipped short.
-  if (lastSilences.length > 0) {
-    const SEARCH = 3.0; // seconds either side
+  // Every boundary is therefore chosen in one pass, picking the combination
+  // that minimises total error across the whole narration. Each candidate cut
+  // is judged on two things: whether the words matched to a line actually fall
+  // inside its span, and whether the resulting length matches what that line's
+  // word count says it should take to say. A cut that looks appealing on its
+  // own is rejected if it forces bad cuts later.
+  //
+  // Because this is global rather than greedy, it doesn't depend on any
+  // property of this particular recording - a different script or a different
+  // voice gets the same treatment.
+  if (lineCount > 1) {
+    const SEARCH = 4.0; // how far a boundary may move, in seconds
 
+    // Word times per line, sorted, for scoring how well a span contains them
+    const lineWordTimes: number[][] = [];
+    for (let i = 0; i < lineCount; i++) {
+      lineWordTimes.push(perLine[i].map((k) => words[k].start).sort((x, y) => x - y));
+    }
+
+    // Candidate positions for each interior boundary: nearby pauses, plus the
+    // boundary the word matching already suggests (in case there is no pause).
+    const candidates: number[][] = [];
     for (let i = 1; i < lineCount; i++) {
       const anchor = bounds[i];
-      const prevBound = bounds[i - 1];
-      const nextBound = bounds[i + 1];
-
-      const expPrev = expectedFor(i - 1);
-      const expNext = expectedFor(i);
-
-      const score = (b: number) => {
-        const dPrev = b - prevBound;
-        const dNext = nextBound - b;
-        if (dPrev < 0.2 || dNext < 0.2) return Infinity;
-        // Relative duration error for the two lines this boundary separates
-        const errPrev = Math.abs(dPrev - expPrev) / Math.max(0.5, expPrev);
-        const errNext = Math.abs(dNext - expNext) / Math.max(0.5, expNext);
-        const move = Math.abs(b - anchor) / SEARCH;
-        return errPrev + errNext + move * 0.6;
-      };
-
-      let best = anchor;
-      let bestScore = score(anchor);
-
+      const opts = [anchor];
       for (const [sStart, sEnd] of lastSilences) {
         const mid = (sStart + sEnd) / 2;
         if (mid < anchor - SEARCH) continue;
         if (mid > anchor + SEARCH) break;
-        const sc = score(mid);
-        if (sc < bestScore) {
-          bestScore = sc;
-          best = mid;
+        opts.push(mid);
+      }
+      opts.sort((a, b) => a - b);
+      // de-duplicate near-identical options
+      const uniq: number[] = [];
+      for (const o of opts) if (!uniq.length || o - uniq[uniq.length - 1] > 0.05) uniq.push(o);
+      candidates.push(uniq);
+    }
+
+    const expectedFor2 = (i: number) => Math.max(0.3, wordCountOf(i) * secPerWordEst);
+
+    // Cost of giving line i the span [a, b]
+    const spanCost = (i: number, a: number, b: number) => {
+      const dur = b - a;
+      if (dur < 0.15) return 1e6;
+      const exp = expectedFor2(i);
+      const durErr = Math.abs(dur - exp) / Math.max(0.5, exp);
+
+      const times = lineWordTimes[i];
+      let outside = 0;
+      for (let k = 0; k < times.length; k++) {
+        if (times[k] < a - 0.05 || times[k] > b + 0.05) outside++;
+      }
+      const anchorErr = times.length > 0 ? outside / times.length : 0;
+
+      // Words landing outside their own line is the more serious error, so it
+      // carries more weight than the length estimate.
+      return anchorErr * 2.0 + durErr;
+    };
+
+    // dp[i][c] = best total cost for lines 0..i-1 with boundary i at candidate c
+    const dp: number[][] = [];
+    const back: number[][] = [];
+
+    const firstOpts = candidates[0];
+    dp.push(firstOpts.map((c) => spanCost(0, 0, c)));
+    back.push(firstOpts.map(() => -1));
+
+    for (let i = 1; i < lineCount - 1; i++) {
+      const prevOpts = candidates[i - 1];
+      const curOpts = candidates[i];
+      const row: number[] = new Array(curOpts.length).fill(Infinity);
+      const brow: number[] = new Array(curOpts.length).fill(0);
+
+      for (let c = 0; c < curOpts.length; c++) {
+        const b = curOpts[c];
+        for (let pAt = 0; pAt < prevOpts.length; pAt++) {
+          const a = prevOpts[pAt];
+          if (a >= b - 0.15) continue;
+          const tot = dp[i - 1][pAt] + spanCost(i, a, b);
+          if (tot < row[c]) {
+            row[c] = tot;
+            brow[c] = pAt;
+          }
         }
       }
-      bounds[i] = best;
+      dp.push(row);
+      back.push(brow);
+    }
+
+    // Close out the final line, which runs to the end of the audio
+    const lastOpts = candidates[lineCount - 2];
+    let bestEnd = 0;
+    let bestCost = Infinity;
+    for (let c = 0; c < lastOpts.length; c++) {
+      const tot = dp[lineCount - 2][c] + spanCost(lineCount - 1, lastOpts[c], totalDuration);
+      if (tot < bestCost) {
+        bestCost = tot;
+        bestEnd = c;
+      }
+    }
+
+    if (bestCost < Infinity) {
+      const chosen: number[] = new Array(lineCount - 1);
+      let c = bestEnd;
+      for (let i = lineCount - 2; i >= 0; i--) {
+        chosen[i] = candidates[i][c];
+        c = back[i][c];
+        if (c < 0) break;
+      }
+      for (let i = 1; i < lineCount; i++) bounds[i] = chosen[i - 1];
     }
   }
 
