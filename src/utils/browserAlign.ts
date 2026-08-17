@@ -867,6 +867,13 @@ export let lastHeardWords: WordStamp[] = [];
 /** Fraction of script words the free decode confirmed verbatim. */
 export let lastAgreement = 0;
 
+/**
+ * Which inference backend actually ran (e.g. "webgpu/q4f16"). Recorded because
+ * a silent fall back to a different backend — or to the older transcript path —
+ * is invisible in the numbers but changes them.
+ */
+export let lastBackend: string | null = null;
+
 async function runForcedAlignWorker(
   audio: Float32Array,
   scriptLines: Array<{ num: number; text: string }>,
@@ -877,6 +884,7 @@ async function runForcedAlignWorker(
   mismatches: Mismatch[];
   matched: number;
   scriptWordCount: number;
+  backend?: string | null;
 }> {
   return new Promise((resolve, reject) => {
     let worker: Worker;
@@ -1082,6 +1090,7 @@ export async function alignInBrowser(
     lastScriptWordTimes = res.words;
     lastHeardWords = res.heard;
     lastMismatches = res.mismatches || [];
+    lastBackend = res.backend || null;
     lastAgreement = res.scriptWordCount > 0 ? res.matched / res.scriptWordCount : 0;
 
     const aligned = res.words.filter((w) => w.start !== null).length;
@@ -1329,6 +1338,7 @@ export function saveAlignmentReport(
   lines.push(`audio duration: ${totalDuration.toFixed(2)}s`);
   lines.push(`script lines: ${scriptLines.length}`);
   lines.push(`recognised words: ${words.length}`);
+  lines.push(`method: ${scriptWordTimes ? `forced alignment (${lastBackend || 'unknown backend'})` : 'transcript matching (fallback)'}`);
   if (scriptWordTimes) {
     const ok = scriptWordTimes.filter((w) => w.start !== null).length;
     lines.push(`script words located: ${ok}/${scriptWordTimes.length}`);

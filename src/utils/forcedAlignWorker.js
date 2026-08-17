@@ -18,6 +18,8 @@ import {
 
 let model = null;
 let tokenizer = null;
+/** Which device/dtype actually loaded, reported back so it lands in the report. */
+let backendUsed = null;
 let libPromise = null;
 
 const TRANSFORMERS_CDNS = [
@@ -49,30 +51,108 @@ function post(type, payload) {
   self.postMessage({ type, ...payload });
 }
 
+// Where the ONNX Runtime WASM files live. transformers.js points at the first
+// of these by default, and if that single fetch fails the whole WASM backend is
+// unavailable — which is exactly what happened in the field:
+//   "no available backend found. ERR: [wasm] TypeError: Failed to fetch
+//    dynamically imported module: .../ort-wasm-simd-threaded.jsep.mjs"
+// so the runtime is probed here and the first CDN that actually answers is used.
+const WASM_CDNS = [
+  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/',
+  'https://unpkg.com/@huggingface/transformers@3.8.1/dist/',
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0-dev.20250409-89f8206ba4/dist/'
+];
+
+async function configureWasm(lib) {
+  const w = lib.env?.backends?.onnx?.wasm;
+  if (!w) return null;
+
+  // Single-threaded on purpose. The threaded runtime needs SharedArrayBuffer,
+  // which needs cross-origin isolation (COOP/COEP response headers) that this
+  // app is not served with. Asking for threads without it fails at load.
+  try { w.numThreads = 1; } catch (e) { /* older builds */ }
+  try { w.proxy = false; } catch (e) { /* ignore */ }
+
+  for (const base of WASM_CDNS) {
+    try {
+      const res = await fetch(base + 'ort-wasm-simd-threaded.jsep.mjs', { cache: 'force-cache' });
+      if (res.ok) {
+        w.wasmPaths = base;
+        return base;
+      }
+    } catch (e) {
+      /* try the next one */
+    }
+  }
+  return null;
+}
+
+// Ordered by what is most likely to work AND most accurate, not by habit.
+//
+// Measured on a 686s narration against an fp32 reference implementation:
+//
+//   dtype   size    verbatim agreement   worst line boundary error
+//   q4f16   ~66MB   93.97%               0.08s
+//   fp16   ~189MB   94.63%               0.08s
+//   q8      ~95MB   88.14%               0.16s
+//
+// q4f16 is both the smallest and the more accurate of the two small ones, so it
+// leads. WebGPU is tried before WASM because it needs none of the WASM runtime
+// files that failed to load in the field, and machines that can run the older
+// Whisper path can generally run it.
+const ATTEMPTS = [
+  { device: 'webgpu', dtype: 'q4f16' },
+  { device: 'wasm', dtype: 'q4f16' },
+  { device: 'wasm', dtype: 'q8' }
+];
+
 async function getModel(modelId, dtype) {
   const lib = await loadTransformers();
   if (model && tokenizer) return { lib, model, tokenizer };
 
   post('progress', { message: 'Loading alignment model (first time only, cached after)...', pct: 4 });
 
-  // q8 is ~95MB against ~380MB for fp32. Quantisation costs some transcription
-  // accuracy but almost none of the timing accuracy that matters here: measured
-  // on a 686s narration, greedy word accuracy fell 94.6% -> 88.1% while every
-  // line boundary moved by less than 0.3s. Forced alignment only needs the
-  // acoustic model to locate characters, not to spell them correctly.
-  model = await lib.AutoModelForCTC.from_pretrained(modelId, {
-    dtype: dtype || 'q8',
-    progress_callback: (p) => {
-      if (p?.status === 'progress' && typeof p.progress === 'number') {
-        post('progress', {
-          message: `Downloading alignment model... ${Math.round(p.progress)}%`,
-          pct: 4 + p.progress * 0.26
-        });
-      }
+  const wasmBase = await configureWasm(lib);
+  if (!wasmBase) {
+    console.log('[forcedAlign] no WASM runtime CDN answered; WebGPU is the only option');
+  }
+
+  // An explicit dtype from the caller overrides the ladder entirely.
+  const attempts = dtype ? [{ device: undefined, dtype }] : ATTEMPTS;
+  const failures = [];
+
+  for (const attempt of attempts) {
+    try {
+      const opts = {
+        dtype: attempt.dtype,
+        progress_callback: (p) => {
+          if (p?.status === 'progress' && typeof p.progress === 'number') {
+            post('progress', {
+              message: `Downloading alignment model... ${Math.round(p.progress)}%`,
+              pct: 4 + p.progress * 0.26
+            });
+          }
+        }
+      };
+      if (attempt.device) opts.device = attempt.device;
+
+      model = await lib.AutoModelForCTC.from_pretrained(modelId, opts);
+      tokenizer = await lib.AutoTokenizer.from_pretrained(modelId);
+      backendUsed = `${attempt.device || 'default'}/${attempt.dtype}`;
+      console.log(`[forcedAlign] using ${backendUsed}`);
+      return { lib, model, tokenizer };
+    } catch (err) {
+      const detail = String(err?.message || err).slice(0, 200);
+      failures.push(`${attempt.device || 'default'}/${attempt.dtype}: ${detail}`);
+      console.log(`[forcedAlign] ${attempt.device || 'default'}/${attempt.dtype} unavailable — ${detail}`);
+      model = null;
+      tokenizer = null;
     }
-  });
-  tokenizer = await lib.AutoTokenizer.from_pretrained(modelId);
-  return { lib, model, tokenizer };
+  }
+
+  // Every backend refused. Say which ones and why, so the next person does not
+  // have to reconstruct it from a browser console.
+  throw new Error(`No usable inference backend. Tried — ${failures.join(' | ')}`);
 }
 
 function readVocab(tokenizer) {
@@ -137,6 +217,7 @@ self.onmessage = async (event) => {
       mismatches,
       matched,
       scriptWordCount: scriptWords.length,
+      backend: backendUsed,
       frames: T,
       fps: FPS
     });
