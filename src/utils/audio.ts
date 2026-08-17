@@ -380,8 +380,13 @@ export async function alignAudioWithScript(
       trimUnmatchedAudio
     );
 
+    // 'browser-forced-aligned' is the primary path (script given to the model,
+    // only the timing inferred); 'browser-whisper-aligned' is the older
+    // transcribe-then-match fallback. Both are real alignments — only
+    // 'proportional-acoustic' means the browser could not align at all.
     if (
-      browserResult.method === 'browser-whisper-aligned' &&
+      (browserResult.method === 'browser-forced-aligned' ||
+        browserResult.method === 'browser-whisper-aligned') &&
       browserResult.timestamps.length === lineCount
     ) {
       return {

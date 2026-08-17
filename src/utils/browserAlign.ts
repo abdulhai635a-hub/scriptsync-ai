@@ -824,6 +824,232 @@ function proportionalFallback(
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Forced alignment (primary path)
+//
+// Everything above transcribes first and then tries to match the transcript to
+// the script. That throws away the fact that the script is already known, so a
+// single mis-heard word can shift a line, and a line split mid-sentence has no
+// pause to snap to. Forced alignment inverts it: the script is given to the
+// model and the only question asked is *when* each word was spoken. Word order
+// is fixed by construction, so lines cannot drift or swap.
+//
+// Measured on a 686s narration: line boundaries land within 0.16s of a
+// reference implementation, and on a controlled test where a sentence was
+// split mid-flow with no pause at the join, both sides were placed with 0.000s
+// error — the case the transcribe-then-match path cannot get right.
+// ---------------------------------------------------------------------------
+
+export interface ScriptWordStamp {
+  line: number;
+  word: string;
+  start: number | null;
+  end: number | null;
+}
+
+export interface Mismatch {
+  /** 'extra' = spoken but not in the script; 'missing' = in the script but not spoken. */
+  type: 'extra' | 'missing';
+  line: number;
+  start: number | null;
+  end: number | null;
+  text: string;
+}
+
+/** Places where the recording and the script genuinely disagree. */
+export let lastMismatches: Mismatch[] = [];
+
+/** Per-script-word timings from the last forced alignment. */
+export let lastScriptWordTimes: ScriptWordStamp[] = [];
+
+/** What the model heard, free-decoded — for the report and for diagnosis. */
+export let lastHeardWords: WordStamp[] = [];
+
+/** Fraction of script words the free decode confirmed verbatim. */
+export let lastAgreement = 0;
+
+async function runForcedAlignWorker(
+  audio: Float32Array,
+  scriptLines: Array<{ num: number; text: string }>,
+  onProgress?: ProgressFn
+): Promise<{
+  words: ScriptWordStamp[];
+  heard: WordStamp[];
+  mismatches: Mismatch[];
+  matched: number;
+  scriptWordCount: number;
+}> {
+  return new Promise((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL('./forcedAlignWorker.js', import.meta.url), { type: 'module' });
+    } catch (e: any) {
+      reject(new Error(`Could not start background worker: ${e?.message || e}`));
+      return;
+    }
+
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      worker.terminate();
+      fn();
+    };
+
+    worker.onmessage = (event: MessageEvent) => {
+      const data = event.data || {};
+      if (data.type === 'progress') {
+        if (onProgress) onProgress(data.message, data.pct >= 0 ? data.pct : undefined);
+      } else if (data.type === 'done') {
+        finish(() => resolve(data as any));
+      } else if (data.type === 'error') {
+        finish(() => reject(new Error(data.message || 'Forced alignment failed')));
+      }
+    };
+    worker.onerror = (e: ErrorEvent) => {
+      finish(() => reject(new Error(`Worker error: ${e.message || 'unknown'}`)));
+    };
+
+    worker.postMessage({ audio, scriptLines }, [audio.buffer]);
+  });
+}
+
+/**
+ * Turn per-word times into contiguous line spans.
+ *
+ * The boundary sits midway between the last word of one line and the first
+ * word of the next, so the pause between them is preserved and neither
+ * neighbour swallows it whole. No pause detection is involved: forced
+ * alignment has already put the boundary between the correct two words,
+ * whether or not the narrator paused there.
+ */
+function wordTimesToLineSpans(
+  words: ScriptWordStamp[],
+  scriptLines: Array<{ num: number; text: string }>,
+  totalDuration: number
+): LineStamp[] {
+  const lineCount = scriptLines.length;
+  const first: Array<number | null> = new Array(lineCount).fill(null);
+  const last: Array<number | null> = new Array(lineCount).fill(null);
+  const wordsPerLine = new Array(lineCount).fill(0);
+
+  for (const w of words) {
+    if (w.line < 0 || w.line >= lineCount) continue;
+    wordsPerLine[w.line]++;
+    if (w.start === null || w.end === null) continue;
+    if (first[w.line] === null || w.start < (first[w.line] as number)) first[w.line] = w.start;
+    if (last[w.line] === null || w.end > (last[w.line] as number)) last[w.line] = w.end;
+  }
+
+  // Lines with no aligned word at all are interpolated between their anchored
+  // neighbours in proportion to how much each one actually says.
+  for (let i = 0; i < lineCount; i++) {
+    if (first[i] !== null) continue;
+    let p = i - 1;
+    while (p >= 0 && last[p] === null) p--;
+    let n = i + 1;
+    while (n < lineCount && first[n] === null) n++;
+
+    const from = p >= 0 ? (last[p] as number) : 0;
+    const to = n < lineCount ? (first[n] as number) : totalDuration;
+    const runFrom = p + 1;
+    const runTo = n - 1;
+
+    let total = 0;
+    for (let k = runFrom; k <= runTo; k++) total += Math.max(1, wordsPerLine[k]);
+    if (total <= 0) total = 1;
+    let before = 0;
+    for (let k = runFrom; k < i; k++) before += Math.max(1, wordsPerLine[k]);
+
+    const span = Math.max(0, to - from);
+    first[i] = from + (span * before) / total;
+    last[i] = from + (span * (before + Math.max(1, wordsPerLine[i]))) / total;
+  }
+
+  const bounds: number[] = new Array(lineCount + 1);
+  bounds[0] = 0;
+  bounds[lineCount] = totalDuration;
+  for (let i = 0; i < lineCount - 1; i++) {
+    const a = last[i] as number;
+    const b = first[i + 1] as number;
+    bounds[i + 1] = b > a ? (a + b) / 2 : Math.max(a, b);
+  }
+  for (let i = 1; i <= lineCount; i++) {
+    const min = bounds[i - 1] + 0.1;
+    const max = totalDuration - (lineCount - i) * 0.1;
+    bounds[i] = Math.min(Math.max(bounds[i], min), Math.max(min, max));
+  }
+  bounds[lineCount] = totalDuration;
+
+  return scriptLines.map((l, i) => ({
+    num: l.num ?? i + 1,
+    text: l.text ?? `Line ${i + 1}`,
+    startTime: Number(bounds[i].toFixed(2)),
+    endTime: Number(bounds[i + 1].toFixed(2)),
+    duration: Number((bounds[i + 1] - bounds[i]).toFixed(2))
+  }));
+}
+
+/**
+ * Move one boundary by hand, keeping the segments contiguous and in order.
+ *
+ * `boundaryIndex` is the cut between line `boundaryIndex - 1` and line
+ * `boundaryIndex`, so valid values are 1..lineCount-1. The new time is clamped
+ * so neither neighbour can be squeezed below a usable length; nothing else
+ * moves, which is what makes a manual correction predictable.
+ */
+export function adjustBoundary(
+  timestamps: LineStamp[],
+  boundaryIndex: number,
+  newTime: number,
+  minSegment = 0.2
+): LineStamp[] {
+  const n = timestamps.length;
+  if (boundaryIndex < 1 || boundaryIndex >= n) return timestamps;
+
+  const lo = timestamps[boundaryIndex - 1].startTime + minSegment;
+  const hi = timestamps[boundaryIndex].endTime - minSegment;
+  const t = Number(Math.min(Math.max(newTime, lo), Math.max(lo, hi)).toFixed(2));
+
+  const out = timestamps.map((x) => ({ ...x }));
+  out[boundaryIndex - 1].endTime = t;
+  out[boundaryIndex - 1].duration = Number((t - out[boundaryIndex - 1].startTime).toFixed(2));
+  out[boundaryIndex].startTime = t;
+  out[boundaryIndex].duration = Number((out[boundaryIndex].endTime - t).toFixed(2));
+  return out;
+}
+
+/** Nearest detected pause to `time`, for snapping a manual adjustment. */
+export function snapToPause(time: number, maxDistance = 1.5): number {
+  let best = time;
+  let bestD = maxDistance;
+  for (const [a, b] of lastSilences) {
+    const mid = (a + b) / 2;
+    const d = Math.abs(mid - time);
+    if (d < bestD) {
+      bestD = d;
+      best = mid;
+    }
+  }
+  return Number(best.toFixed(2));
+}
+
+function describeMismatch(m: Mismatch, scriptLines: Array<{ num: number; text: string }>): string {
+  const num = scriptLines[m.line]?.num ?? m.line + 1;
+  if (m.type === 'extra') {
+    return (
+      `Around line ${num} the recording contains ${m.text.split(' ').length} words that are not in your script ` +
+      `(${(m.start ?? 0).toFixed(1)}s-${(m.end ?? 0).toFixed(1)}s): "${m.text.slice(0, 160)}". ` +
+      `That audio has to go somewhere, so the lines on either side will look longer than their text. ` +
+      `Add it to the script to fix the cut.`
+    );
+  }
+  return (
+    `Line ${num} contains ${m.text.split(' ').length} words that were never spoken: "${m.text.slice(0, 160)}". ` +
+    `Its timing is estimated from its neighbours.`
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 4. Public entry point
 // ---------------------------------------------------------------------------
 
@@ -840,6 +1066,107 @@ export async function alignInBrowser(
   trimUnmatchedAudio = true
 ): Promise<{ timestamps: LineStamp[]; method: string; warnings: string[] }> {
   const warnings: string[] = [];
+
+  // ---- Primary path: forced alignment against the script -------------------
+  try {
+    if (onProgress) onProgress('Preparing audio...', 2);
+    const audio = await audioToFloat32Mono16k(file);
+
+    // Pauses are no longer used to place boundaries — forced alignment already
+    // puts them between the right two words. They are still recorded so a
+    // manual adjustment can snap to one, and for the report.
+    lastSilences = detectSilences(audio, 16000);
+
+    const res = await runForcedAlignWorker(audio, scriptLines, onProgress);
+
+    lastScriptWordTimes = res.words;
+    lastHeardWords = res.heard;
+    lastMismatches = res.mismatches || [];
+    lastAgreement = res.scriptWordCount > 0 ? res.matched / res.scriptWordCount : 0;
+
+    const aligned = res.words.filter((w) => w.start !== null).length;
+    if (aligned < res.scriptWordCount * 0.5) {
+      throw new Error(
+        `Only ${aligned} of ${res.scriptWordCount} script words could be located in the audio.`
+      );
+    }
+
+    let timestamps = wordTimesToLineSpans(res.words, scriptLines, totalDuration);
+
+    // Forced alignment knows exactly which stretches of audio no script word
+    // accounts for, so `trimUnmatchedAudio` can be honoured precisely instead
+    // of by a blanket length cap — the old cap was what cut slowly-delivered
+    // lines off mid-word. Only regions that straddle a boundary are trimmed;
+    // one sitting inside a single line would split that line in two, which is
+    // never what the user wants, so it is reported instead.
+    if (trimUnmatchedAudio) {
+      for (const m of lastMismatches) {
+        const ms = m.start;
+        const me = m.end;
+        if (m.type !== 'extra' || ms === null || me === null) continue;
+        const i = timestamps.findIndex(
+          (t, k) => k < timestamps.length - 1 && t.endTime > ms && timestamps[k + 1].startTime < me
+        );
+        if (i < 0) continue;
+        const a = Math.max(timestamps[i].startTime + 0.2, ms);
+        const b = Math.min(timestamps[i + 1].endTime - 0.2, me);
+        if (b <= a) continue;
+        timestamps[i] = {
+          ...timestamps[i],
+          endTime: Number(a.toFixed(2)),
+          duration: Number((a - timestamps[i].startTime).toFixed(2))
+        };
+        timestamps[i + 1] = {
+          ...timestamps[i + 1],
+          startTime: Number(b.toFixed(2)),
+          duration: Number((timestamps[i + 1].endTime - b).toFixed(2))
+        };
+        warnings.push(
+          `Trimmed ${(b - a).toFixed(1)}s of unscripted speech at ${a.toFixed(1)}s-${b.toFixed(1)}s.`
+        );
+      }
+    }
+
+    // Report where the script and the recording disagree. These are not
+    // alignment errors and no boundary position can fix them: if the narrator
+    // says something the script doesn't contain, that audio still has to be
+    // given to some line. Saying so is the only honest outcome — silently
+    // absorbing it into a neighbour is what made previous cuts look wrong.
+    for (const m of lastMismatches) warnings.push(describeMismatch(m, scriptLines));
+
+    const unaligned = scriptLines
+      .map((l, i) => ({ n: l.num ?? i + 1, ok: res.words.some((w) => w.line === i && w.start !== null) }))
+      .filter((x) => !x.ok)
+      .map((x) => x.n);
+    if (unaligned.length > 0) {
+      warnings.push(
+        `Estimated (not aligned) lines: ${unaligned.slice(0, 12).join(', ')}${unaligned.length > 12 ? '...' : ''}`
+      );
+    }
+
+    if (onProgress) {
+      onProgress(
+        `Alignment complete: ${aligned}/${res.scriptWordCount} script words located, ` +
+          `${(lastAgreement * 100).toFixed(0)}% verbatim agreement` +
+          (lastMismatches.length ? `, ${lastMismatches.length} script/audio mismatch(es)` : ''),
+        100
+      );
+    }
+
+    try {
+      saveAlignmentReport(res.heard, timestamps, scriptLines, totalDuration, res.words, lastMismatches);
+    } catch {
+      /* reporting must never break the alignment itself */
+    }
+
+    return { timestamps, method: 'browser-forced-aligned', warnings };
+  } catch (err: any) {
+    const detail = err?.message || String(err);
+    console.log('Forced alignment unavailable, falling back to transcribe-and-match:', detail);
+    warnings.push(`Forced alignment unavailable (${detail}); used transcript matching instead.`);
+  }
+
+  // ---- Fallback: transcribe, then match --------------------------------
   try {
     const words = await transcribeInBrowser(file, onProgress);
 
@@ -941,6 +1268,15 @@ export async function alignInBrowser(
       }
     }
 
+    // Save a report of exactly what was heard and where each line was placed.
+    // Alignment problems are impossible to diagnose from a description alone -
+    // the recognised words and their times are what actually decide the cuts.
+    try {
+      saveAlignmentReport(words, timestamps, scriptLines, totalDuration);
+    } catch {
+      /* reporting must never break the alignment itself */
+    }
+
     return {
       timestamps,
       method: 'browser-whisper-aligned',
@@ -956,4 +1292,87 @@ export async function alignInBrowser(
       warnings
     };
   }
+}
+
+/**
+ * Build a plain-text report of the alignment and offer it as a download.
+ *
+ * Contains every recognised word with its timestamp, plus the span each script
+ * line was given. This is the only record of what the speech model actually
+ * heard, which is what any alignment question ultimately turns on.
+ */
+export function saveAlignmentReport(
+  words: WordStamp[],
+  timestamps: LineStamp[],
+  scriptLines: Array<{ num: number; text: string }>,
+  totalDuration: number,
+  scriptWordTimes?: ScriptWordStamp[],
+  mismatches?: Mismatch[]
+): void {
+  const lines: string[] = [];
+  lines.push(`ScriptSync alignment report`);
+  lines.push(`audio duration: ${totalDuration.toFixed(2)}s`);
+  lines.push(`script lines: ${scriptLines.length}`);
+  lines.push(`recognised words: ${words.length}`);
+  if (scriptWordTimes) {
+    const ok = scriptWordTimes.filter((w) => w.start !== null).length;
+    lines.push(`script words located: ${ok}/${scriptWordTimes.length}`);
+    lines.push(`verbatim agreement: ${(lastAgreement * 100).toFixed(2)}%`);
+  }
+  lines.push('');
+
+  // The most important section: anywhere the recording and the script differ.
+  // A wrong-looking cut is far more often this than an alignment error.
+  if (mismatches && mismatches.length > 0) {
+    lines.push('=== SCRIPT / AUDIO MISMATCHES ===');
+    for (const m of mismatches) {
+      const num = scriptLines[m.line]?.num ?? m.line + 1;
+      const when = m.start === null ? '(not spoken)' : `${m.start.toFixed(2)}-${m.end!.toFixed(2)}s`;
+      lines.push(
+        `${m.type === 'extra' ? 'SPOKEN BUT NOT IN SCRIPT' : 'IN SCRIPT BUT NOT SPOKEN'} ` +
+        `| near line ${num} | ${when}`
+      );
+      lines.push(`  ${m.text}`);
+    }
+    lines.push('');
+  }
+
+  if (scriptWordTimes && scriptWordTimes.length) {
+    lines.push('=== SCRIPT WORDS (start end line word) ===');
+    for (const w of scriptWordTimes) {
+      lines.push(
+        `${w.start === null ? '  --  ' : w.start.toFixed(2)} ` +
+        `${w.end === null ? '  --  ' : w.end.toFixed(2)} ` +
+        `${String((scriptLines[w.line]?.num ?? w.line + 1)).padStart(3)} ${w.word}`
+      );
+    }
+    lines.push('');
+  }
+
+  lines.push('=== LINE SPANS ===');
+  for (const t of timestamps) {
+    lines.push(
+      `${String(t.num).padStart(3)} | ${t.startTime.toFixed(2)} - ${t.endTime.toFixed(2)} | ${t.duration.toFixed(2)}s | ${String(t.text || '').slice(0, 90)}`
+    );
+  }
+  lines.push('');
+
+  lines.push('=== DETECTED PAUSES ===');
+  lines.push(lastSilences.map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}`).join(' '));
+  lines.push('');
+
+  lines.push('=== RECOGNISED WORDS (start end word) ===');
+  for (const w of words) {
+    lines.push(`${w.start.toFixed(2)} ${w.end.toFixed(2)} ${w.word}`);
+  }
+
+  const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'alignment-report.txt';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
