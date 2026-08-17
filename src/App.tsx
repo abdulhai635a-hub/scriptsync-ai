@@ -142,6 +142,34 @@ export default function App() {
   const animFrameIdRef = useRef<number | null>(null);
   const lastTimeRef = useRef<number>(performance.now());
 
+  // Playback speed lives here, not only in the viewport, because the playhead
+  // clock has to advance at the same rate the audio does. While it was viewport
+  // state the audio ran at the chosen rate and the clock always ran at 1x, so
+  // subtitles drifted away from the voice as soon as the speed wasn't 1.0.
+  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
+  const playbackSpeedRef = useRef(1.0);
+  playbackSpeedRef.current = playbackSpeed;
+
+  // The playhead is derived from a single anchor (wall-clock instant + media
+  // position at that instant) rather than by adding up per-frame deltas.
+  // Accumulating deltas loses time on every dropped or long frame and never
+  // gets it back, so the picture and the captions fall progressively behind the
+  // audio — which plays on its own Web Audio clock and doesn't drift.
+  const clockAnchorRef = useRef<{ wall: number; media: number } | null>(null);
+  const reanchorClock = useCallback((media: number) => {
+    clockAnchorRef.current = { wall: performance.now(), media };
+  }, []);
+
+  /** Move the playhead from outside the play loop (seek, reset, jump). */
+  const seekTo = useCallback(
+    (time: number) => {
+      const t = Math.max(0, time);
+      reanchorClock(t);
+      setCurrentTime(t);
+    },
+    [reanchorClock]
+  );
+
   // Cloud Sync State
   const [isSaving, setIsSaving] = useState(false);
   const [hasUnsaved, setHasUnsaved] = useState(false);
@@ -209,18 +237,20 @@ export default function App() {
     }
 
     lastTimeRef.current = performance.now();
+    reanchorClock(currentTimeRef.current);
 
     const loop = (now: number) => {
-      const deltaSec = (now - lastTimeRef.current) / 1000;
-      lastTimeRef.current = now;
-
-      setCurrentTime((prevTime) => {
-        const nextTime = prevTime + deltaSec;
+      const anchor = clockAnchorRef.current;
+      if (anchor) {
+        const elapsed = ((now - anchor.wall) / 1000) * playbackSpeedRef.current;
+        const nextTime = anchor.media + elapsed;
         if (nextTime >= project.totalDuration) {
-          return 0; // Loop back to start
+          reanchorClock(0); // loop back to the start, and re-anchor with it
+          setCurrentTime(0);
+        } else {
+          setCurrentTime(nextTime);
         }
-        return nextTime;
-      });
+      }
 
       if (isPlayingRef.current) {
         animFrameIdRef.current = requestAnimationFrame(loop);
@@ -232,7 +262,9 @@ export default function App() {
     return () => {
       if (animFrameIdRef.current) cancelAnimationFrame(animFrameIdRef.current);
     };
-  }, [isPlaying, project.totalDuration]);
+    // playbackSpeed is a dependency so the anchor is rebuilt at the new rate
+    // instead of the old rate being extrapolated from a stale anchor.
+  }, [isPlaying, project.totalDuration, playbackSpeed, reanchorClock]);
 
   // Auto-Save Debounce to Firestore & Local Storage
   useEffect(() => {
@@ -336,6 +368,20 @@ export default function App() {
           const sliced = sliceAudioBuffer(audioBuffer, sliceStart, sliceEnd);
           const converted = convertAudioBufferToBlob(sliced);
 
+          // Carry the measured word times into this clip, rebased so 0 is the
+          // start of the clip. Without this the subtitle has to guess when each
+          // word is spoken by dividing the line's length by its word count,
+          // which is wrong by design: "evolutionary" takes ten times as long to
+          // say as "the".
+          const lineWords = (alignment.wordTimes || [])
+            .filter((w) => w.line === i && w.start !== null && w.end !== null)
+            .map((w) => ({
+              word: w.word,
+              start: Number(((w.start as number) - sliceStart).toFixed(3)),
+              end: Number(((w.end as number) - sliceStart).toFixed(3))
+            }))
+            .filter((w) => w.end > 0 && w.start < segDur);
+
           nextAudioMap[line.num] = {
             file: converted.blob,
             name: `${file.name.replace(/\.[^/.]+$/, '')} (Scene ${line.num})`,
@@ -343,7 +389,8 @@ export default function App() {
             duration: segDur,
             startTime: 0,
             endTime: segDur,
-            isMasterTrackSlice: true
+            isMasterTrackSlice: true,
+            words: lineWords.length > 0 ? lineWords : undefined
           };
           cumTime += segDur;
         }
@@ -480,7 +527,16 @@ export default function App() {
         text: line.text,
         startTime: cumulativeTime,
         endTime: cumulativeTime + duration,
-        duration
+        duration,
+        // Word times arrive relative to the clip; shift them onto the project
+        // timeline so the subtitle can be driven straight from the playhead.
+        words: audio?.words
+          ? audio.words.map((w) => ({
+              word: w.word,
+              start: cumulativeTime + w.start,
+              end: cumulativeTime + w.end
+            }))
+          : undefined
       };
       nextCaptions.push(captionLine);
 
@@ -512,7 +568,7 @@ export default function App() {
 
     setCurrentStep(3);
     setSelectedSceneIndex(0);
-    setCurrentTime(0);
+    seekTo(0);
   };
 
   // Step 4: Render Video
@@ -916,15 +972,27 @@ export default function App() {
           });
         }
 
-        // Caption handling
+        // Caption handling. The measured word times are rebased twice: once to
+        // strip the slice offset, once onto the project timeline, so the
+        // subtitle can highlight the spoken word straight from the playhead.
         const existingCap = project.captions[i];
+        const capWords = (alignment.wordTimes || [])
+          .filter((w) => w.line === i && w.start !== null && w.end !== null)
+          .map((w) => ({
+            word: w.word,
+            start: Number((cumulativeTime + (w.start as number) - sliceStart).toFixed(3)),
+            end: Number((cumulativeTime + (w.end as number) - sliceStart).toFixed(3))
+          }))
+          .filter((w) => w.end > cumulativeTime && w.start < cumulativeTime + segDuration);
+
         nextCaptions.push({
           id: existingCap?.id || `cap_${i + 1}_${Date.now()}`,
           num: i + 1,
           text: existingCap?.text || line.text,
           duration: segDuration,
           startTime: cumulativeTime,
-          endTime: cumulativeTime + segDuration
+          endTime: cumulativeTime + segDuration,
+          words: capWords.length > 0 ? capWords : undefined
         });
 
         cumulativeTime += segDuration;
@@ -1194,7 +1262,7 @@ export default function App() {
                 const updated = project.scenes.map((s) => ({ ...s, motion }));
                 recordHistory({ ...project, scenes: updated });
               }}
-              onSeekToTime={(t) => setCurrentTime(t)}
+              onSeekToTime={(t) => seekTo(t)}
               onOpenVoiceRecorder={(sceneNum) => {
                 const cap = project.captions.find((c) => c.num === sceneNum);
                 setVoiceRecorderModal({
@@ -1234,13 +1302,15 @@ export default function App() {
               totalDuration={project.totalDuration}
               isPlaying={isPlaying}
               onTogglePlay={() => setIsPlaying(!isPlaying)}
-              onSeek={(t) => setCurrentTime(t)}
+              onSeek={(t) => seekTo(t)}
               safeZoneOverlay={safeZoneOverlay}
               gridOverlay={gridOverlay}
               onToggleSafeZone={() => setSafeZoneOverlay(!safeZoneOverlay)}
               onToggleGrid={() => setGridOverlay(!gridOverlay)}
               onChangeAspectRatio={(ratio) => recordHistory({ ...project, aspectRatio: ratio })}
               onOpenExportModal={() => setCurrentStep(4)}
+              playbackSpeed={playbackSpeed}
+              onChangePlaybackSpeed={setPlaybackSpeed}
             />
 
             {/* Right Inspector Panel */}
@@ -1280,7 +1350,7 @@ export default function App() {
             selectedCaptionIndex={selectedCaptionIndex}
             onSelectScene={handleSelectScene}
             onSelectCaption={handleSelectCaption}
-            onSeek={(t) => setCurrentTime(t)}
+            onSeek={(t) => seekTo(t)}
             onAddScene={handleAddScene}
             onDuplicateScene={handleDuplicateScene}
             onDeleteScene={handleDeleteScene}
@@ -1319,7 +1389,7 @@ export default function App() {
           recordHistory(tmpl);
           setSelectedSceneIndex(0);
           setSelectedCaptionIndex(null);
-          setCurrentTime(0);
+          seekTo(0);
         }}
       />
 
@@ -1331,13 +1401,13 @@ export default function App() {
         onSelectProject={(loadedProj) => {
           recordHistory(loadedProj);
           setSelectedSceneIndex(0);
-          setCurrentTime(0);
+          seekTo(0);
         }}
         onNewProject={() => {
           const fresh = generateDefaultLiveProject();
           recordHistory(fresh);
           setSelectedSceneIndex(0);
-          setCurrentTime(0);
+          seekTo(0);
         }}
       />
 

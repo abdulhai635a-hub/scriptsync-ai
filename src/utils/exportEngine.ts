@@ -1,11 +1,12 @@
-import type { 
-  SceneClip, 
-  CaptionLine, 
-  VoiceClip, 
-  BgmTrackConfig, 
-  SubtitleStyleConfig, 
-  OverlayConfig, 
-  AspectRatioType 
+import type {
+  SceneClip,
+  CaptionLine,
+  CaptionWord,
+  VoiceClip,
+  BgmTrackConfig,
+  SubtitleStyleConfig,
+  OverlayConfig,
+  AspectRatioType
 } from '../types';
 
 export interface RenderProgress {
@@ -460,6 +461,80 @@ export interface CaptionWordChunk {
   duration: number;
   chunkIndex: number;
   totalChunks: number;
+  /** Measured start/end for each word in `words`, when the caption has them. */
+  wordTimes?: Array<{ start: number; end: number }>;
+  /** True when the times above came from alignment rather than from word counts. */
+  measured?: boolean;
+}
+
+/**
+ * Line up the caption's displayed words with the measured words from alignment.
+ *
+ * The two lists come from the same text but are not guaranteed to be the same
+ * length: alignment drops tokens that carry no letters at all (a lone "..." or
+ * a dash), because there is nothing in them for a speech model to find. So the
+ * lists are walked together and matched on the raw text rather than zipped by
+ * index, and any display word left without a match is interpolated from its
+ * neighbours instead of being dropped or silently misaligned.
+ */
+function matchWordTimes(
+  rawWords: string[],
+  measured: CaptionWord[] | undefined,
+  fallbackStart: number,
+  fallbackEnd: number
+): { times: Array<{ start: number; end: number }>; measured: boolean } {
+  const span = Math.max(0.2, fallbackEnd - fallbackStart);
+  const proportional = () => ({
+    times: rawWords.map((_, i) => ({
+      start: fallbackStart + (span * i) / rawWords.length,
+      end: fallbackStart + (span * (i + 1)) / rawWords.length
+    })),
+    measured: false
+  });
+
+  if (!measured || measured.length === 0) return proportional();
+
+  const key = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const out: Array<{ start: number; end: number } | null> = [];
+  let p = 0;
+  let hits = 0;
+
+  for (const raw of rawWords) {
+    const k = key(raw);
+    let found: { start: number; end: number } | null = null;
+    // Look a little way ahead so one dropped token doesn't desynchronise the
+    // rest of the line.
+    for (let q = p; q < Math.min(measured.length, p + 3); q++) {
+      if (key(measured[q].word) === k && k.length > 0) {
+        found = { start: measured[q].start, end: measured[q].end };
+        p = q + 1;
+        hits++;
+        break;
+      }
+    }
+    out.push(found);
+  }
+
+  // If barely anything lined up, the measured list doesn't describe this text
+  // (the caption was edited after aligning, say) — don't trust it at all.
+  if (hits < rawWords.length * 0.6) return proportional();
+
+  // Fill unmatched words by sharing the gap between the matches around them.
+  for (let i = 0; i < out.length; i++) {
+    if (out[i]) continue;
+    let a = i - 1;
+    while (a >= 0 && !out[a]) a--;
+    let b = i + 1;
+    while (b < out.length && !out[b]) b++;
+    const from = a >= 0 ? (out[a] as { start: number; end: number }).end : fallbackStart;
+    const to = b < out.length ? (out[b] as { start: number; end: number }).start : fallbackEnd;
+    const n = b - a - 1;
+    const k = i - a;
+    const step = Math.max(0, to - from) / Math.max(1, n);
+    out[i] = { start: from + step * (k - 1), end: from + step * k };
+  }
+
+  return { times: out as Array<{ start: number; end: number }>, measured: true };
 }
 
 /**
@@ -523,17 +598,28 @@ export function getCaptionChunks(
     currentIndex += take;
   }
 
-  // Calculate proportional timestamps for each chunk
-  const totalWords = rawWords.length;
-  const captionDuration = Math.max(0.6, caption.duration || (caption.endTime - caption.startTime));
-  let currentStart = caption.startTime;
+  // Timestamps for each chunk.
+  //
+  // Where alignment measured when each word was actually spoken, the chunk
+  // simply spans its own first and last word. Only when there is no measured
+  // timing does this fall back to slicing the line up by word count — which is
+  // wrong whenever the speaker doesn't give every word the same length, i.e.
+  // always. That fallback is why a highlighted word could sit seconds away from
+  // the voice.
+  const captionEnd = caption.endTime || caption.startTime + (caption.duration || 0.6);
+  const { times, measured } = matchWordTimes(rawWords, caption.words, caption.startTime, captionEnd);
 
+  let wordCursor = 0;
   return chunks.map((c, idx) => {
-    const chunkWordCount = c.words.length;
-    const chunkDur = (chunkWordCount / totalWords) * captionDuration;
-    const start = currentStart;
-    const end = Math.min(caption.endTime, currentStart + chunkDur);
-    currentStart = end;
+    const from = wordCursor;
+    const to = wordCursor + c.words.length;
+    wordCursor = to;
+
+    const slice = times.slice(from, to);
+    const start = slice.length ? slice[0].start : caption.startTime;
+    // A chunk runs until the next one begins, so the highlight never blanks out
+    // during the pause between two words.
+    const end = to < times.length ? times[to].start : Math.max(captionEnd, slice.length ? slice[slice.length - 1].end : captionEnd);
 
     return {
       text: c.words.join(' '),
@@ -542,9 +628,35 @@ export function getCaptionChunks(
       endTime: end,
       duration: Math.max(0.3, end - start),
       chunkIndex: idx,
-      totalChunks: chunks.length
+      totalChunks: chunks.length,
+      wordTimes: slice,
+      measured
     };
   });
+}
+
+/**
+ * Which word of a chunk is being spoken at `currentTime`.
+ *
+ * With measured word times this is a lookup, not an estimate: the word that
+ * lights up is the one the voice is on. The old behaviour — dividing the
+ * chunk's length by its word count — assumed every word takes equally long, so
+ * the highlight ran ahead of short words and behind long ones, which is what
+ * made it look permanently late.
+ */
+export function activeWordIndex(chunk: CaptionWordChunk, currentTime: number): number {
+  const wt = chunk.wordTimes;
+  if (chunk.measured && wt && wt.length === chunk.words.length && wt.length > 0) {
+    let idx = 0;
+    for (let i = 0; i < wt.length; i++) {
+      // A word stays lit through the silence after it, until the next begins.
+      if (currentTime >= wt[i].start) idx = i;
+      else break;
+    }
+    return idx;
+  }
+  const progress = Math.max(0, Math.min(1, (currentTime - chunk.startTime) / Math.max(0.001, chunk.duration)));
+  return Math.min(chunk.words.length - 1, Math.floor(progress * chunk.words.length));
 }
 
 function drawRenderedSubtitle(
@@ -579,10 +691,15 @@ function drawRenderedSubtitle(
 
   // Calculate timing progress within this 3-6 word chunk (0.0 to 1.0)
   const chunkProgress = Math.max(0, Math.min(1, (currentTime - activeChunk.startTime) / activeChunk.duration));
-  const activeWordIdx = Math.min(
-    activeChunk.words.length - 1,
-    Math.floor(chunkProgress * activeChunk.words.length)
-  );
+
+  // Which word is being spoken right now.
+  //
+  // With measured word times this is a lookup, not an estimate: the word that
+  // lights up is the one the voice is on. The old behaviour — dividing the
+  // chunk's length by its word count — assumed every word takes equally long,
+  // so the highlight ran ahead of short words and behind long ones and looked
+  // permanently late.
+  const activeWordIdx = activeWordIndex(activeChunk, currentTime);
 
   const rawWords = activeChunk.words.map((w) =>
     style.textTransform === 'uppercase' ? w.toUpperCase() : style.textTransform === 'capitalize' ? w.charAt(0).toUpperCase() + w.slice(1) : w

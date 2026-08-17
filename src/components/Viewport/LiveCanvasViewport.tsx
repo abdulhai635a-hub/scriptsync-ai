@@ -52,6 +52,13 @@ interface LiveCanvasViewportProps {
   onToggleGrid?: () => void;
   onChangeAspectRatio?: (ratio: AspectRatioType) => void;
   onOpenExportModal: () => void;
+  /**
+   * Playback rate is owned by the parent because the playhead clock has to
+   * advance at the same rate as the audio. Kept optional so the component still
+   * works standalone, in which case it falls back to its own local state.
+   */
+  playbackSpeed?: number;
+  onChangePlaybackSpeed?: (speed: number) => void;
 }
 
 export const LiveCanvasViewport: React.FC<LiveCanvasViewportProps> = ({
@@ -72,11 +79,18 @@ export const LiveCanvasViewport: React.FC<LiveCanvasViewportProps> = ({
   onToggleSafeZone,
   onToggleGrid,
   onChangeAspectRatio,
-  onOpenExportModal
+  onOpenExportModal,
+  playbackSpeed: playbackSpeedProp,
+  onChangePlaybackSpeed
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
+  const [localSpeed, setLocalSpeed] = useState<number>(1.0);
+  const playbackSpeed = playbackSpeedProp ?? localSpeed;
+  const setPlaybackSpeed = (s: number) => {
+    setLocalSpeed(s);
+    if (onChangePlaybackSpeed) onChangePlaybackSpeed(s);
+  };
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(1.0);
   const [isLooping, setIsLooping] = useState(true);

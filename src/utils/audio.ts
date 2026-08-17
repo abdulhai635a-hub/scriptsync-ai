@@ -347,6 +347,13 @@ export interface AlignmentResult {
   timestamps: Array<{ num: number; startTime: number; endTime: number; duration: number }>;
   warnings?: string[];
   method?: string;
+  /**
+   * Measured time of every script word, in the ORIGINAL recording's timeline,
+   * tagged with the line it belongs to. Only the forced-alignment path can
+   * produce this; the older transcript-matching path leaves it undefined and
+   * callers fall back to estimating word times from word counts.
+   */
+  wordTimes?: Array<{ line: number; word: string; start: number | null; end: number | null }>;
 }
 
 // AI + Speech boundary alignment that matches exact spoken words in audio to script lines
@@ -389,10 +396,17 @@ export async function alignAudioWithScript(
         browserResult.method === 'browser-whisper-aligned') &&
       browserResult.timestamps.length === lineCount
     ) {
+      const { lastScriptWordTimes } = await import('./browserAlign');
       return {
         timestamps: browserResult.timestamps,
         warnings: browserResult.warnings,
-        method: browserResult.method
+        method: browserResult.method,
+        // Only the forced-alignment path fills this in. Left undefined by the
+        // fallback, which has no per-script-word timing to give.
+        wordTimes:
+          browserResult.method === 'browser-forced-aligned' && lastScriptWordTimes.length > 0
+            ? lastScriptWordTimes
+            : undefined
       };
     }
 

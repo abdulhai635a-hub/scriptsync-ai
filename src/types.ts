@@ -163,6 +163,13 @@ export interface AudioItem {
   isMasterTrackSlice?: boolean;
   masterAudioUrl?: string;
   masterDuration?: number;
+  /**
+   * When this clip came from forced alignment, the measured time of every word
+   * in it, relative to the START OF THIS CLIP (not the original recording).
+   * This is what lets a subtitle highlight the word actually being spoken
+   * instead of guessing from word counts.
+   */
+  words?: CaptionWord[];
 }
 
 export interface ImageItem {
