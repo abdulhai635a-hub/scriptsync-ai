@@ -1104,12 +1104,27 @@ export async function alignInBrowser(
         const ms = m.start;
         const me = m.end;
         if (m.type !== 'extra' || ms === null || me === null) continue;
-        const i = timestamps.findIndex(
-          (t, k) => k < timestamps.length - 1 && t.endTime > ms && timestamps[k + 1].startTime < me
-        );
+
+        // Pick the boundary nearest the unscripted stretch rather than one
+        // strictly inside it. Requiring containment was wrong: the boundary
+        // normally sits just *before* the stretch begins (the previous line's
+        // last word ends, then the unscripted speech starts), so the test
+        // never fired and nothing was trimmed.
+        const centre = (ms + me) / 2;
+        const reach = (me - ms) / 2 + 2;
+        let i = -1;
+        let bestD = Infinity;
+        for (let k = 0; k < timestamps.length - 1; k++) {
+          const d = Math.abs(timestamps[k].endTime - centre);
+          if (d < bestD && d <= reach) {
+            bestD = d;
+            i = k;
+          }
+        }
         if (i < 0) continue;
-        const a = Math.max(timestamps[i].startTime + 0.2, ms);
-        const b = Math.min(timestamps[i + 1].endTime - 0.2, me);
+
+        const a = Math.max(timestamps[i].startTime + 0.2, Math.min(ms, timestamps[i].endTime));
+        const b = Math.min(timestamps[i + 1].endTime - 0.2, Math.max(me, timestamps[i + 1].startTime));
         if (b <= a) continue;
         timestamps[i] = {
           ...timestamps[i],

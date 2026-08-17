@@ -361,17 +361,59 @@ export function alignScript(logProbs, T, V, scriptWords, vocab, blank, idToToken
   }
   flushRun();
 
-  // ---- segments between anchors
-  const segs = [];
-  let prevS = 0;
-  let prevT = 0;
+  // ---- disagreements, found before alignment because they change it
+  const mismatches = findMismatches(scriptWords, scriptNorm, heard, heardNorm, map);
+
+  // ---- cut points: where a segment must start and end
+  //
+  // A normal anchor is a single instant — the segment before it ends there and
+  // the segment after it starts there. A stretch of speech that appears in no
+  // script line is different: it needs a segment to END at where it begins and
+  // the next one to START at where it ends, so the frames in between belong to
+  // no script word at all.
+  //
+  // Without that hole, forced alignment has nowhere to put the unscripted
+  // audio — every script word must be assigned somewhere — so it drags the
+  // following words backwards across it. That is what put "or you can" at 638s
+  // when the narrator actually says it at 647.5s.
+  const cuts = [{ si: 0, tIn: 0, tOut: 0 }];
   for (const a of anchors) {
     const fr = Math.max(0, Math.round(heard[a.hi].start * FPS));
-    if (a.si > prevS && fr > prevT) segs.push({ s0: prevS, s1: a.si, t0: prevT, t1: fr });
-    prevS = a.si;
-    prevT = fr;
+    cuts.push({ si: a.si, tIn: fr, tOut: fr });
   }
-  if (prevS < scriptWords.length) segs.push({ s0: prevS, s1: scriptWords.length, t0: prevT, t1: T });
+  for (const m of mismatches) {
+    if (m.type !== 'extra' || m.siAfter === undefined) continue;
+    cuts.push({
+      si: m.siAfter,
+      tIn: Math.max(0, Math.round(m.start * FPS)),
+      tOut: Math.min(T, Math.round(m.end * FPS))
+    });
+  }
+  cuts.push({ si: scriptWords.length, tIn: T, tOut: T });
+
+  // Keep them ordered and consistent: a later cut may never start before an
+  // earlier one ends, and an anchor that fell inside an unscripted stretch is
+  // dropped rather than allowed to contradict it.
+  cuts.sort((a, b) => a.si - b.si || a.tIn - b.tIn);
+  const keep = [cuts[0]];
+  for (let i = 1; i < cuts.length; i++) {
+    const prev = keep[keep.length - 1];
+    const c = cuts[i];
+    if (c.si <= prev.si || c.tIn < prev.tOut) continue;
+    keep.push(c);
+  }
+  if (keep[keep.length - 1].si !== scriptWords.length) {
+    keep.push({ si: scriptWords.length, tIn: T, tOut: T });
+  }
+
+  const segs = [];
+  for (let i = 0; i < keep.length - 1; i++) {
+    const s0 = keep[i].si;
+    const s1 = keep[i + 1].si;
+    const t0 = keep[i].tOut;
+    const t1 = keep[i + 1].tIn;
+    if (s1 > s0 && t1 > t0) segs.push({ s0, s1, t0, t1 });
+  }
 
   // ---- subdivide any segment whose Viterbi table would be too large
   const sized = [];
@@ -439,9 +481,6 @@ export function alignScript(logProbs, T, V, scriptWords, vocab, blank, idToToken
     }
   }
 
-  // ---- disagreements worth reporting
-  const mismatches = findMismatches(scriptWords, scriptNorm, heard, heardNorm, map);
-
   return { wordTimes, heard, mismatches, matched: exact.reduce((a, b) => a + b, 0) };
 }
 
@@ -474,12 +513,21 @@ function findMismatches(scriptWords, scriptNorm, heard, heardNorm, map) {
     let k = j;
     while (k < heardNorm.length && !claimed[k]) k++;
     if (k - j >= MIN_RUN) {
-      // which script line does this land next to?
-      let line = 0;
-      for (let i = 0; i < map.length; i++) if (map[i] >= 0 && map[i] < j) line = scriptWords[i].line;
+      // The script words either side of the run: the last one matched before
+      // it, and the first one matched after. `siAfter` is what the aligner
+      // needs — the script word that must not be allowed to start until this
+      // unscripted stretch is over.
+      let siBefore = -1;
+      let siAfter = -1;
+      for (let i = 0; i < map.length; i++) {
+        if (map[i] < 0) continue;
+        if (map[i] < j) siBefore = i;
+        else if (map[i] >= k && siAfter < 0) siAfter = i;
+      }
       out.push({
         type: 'extra',
-        line,
+        line: siBefore >= 0 ? scriptWords[siBefore].line : 0,
+        siAfter: siAfter >= 0 ? siAfter : undefined,
         start: heard[j].start,
         end: heard[k - 1].end,
         text: heardNorm.slice(j, k).join(' ')
