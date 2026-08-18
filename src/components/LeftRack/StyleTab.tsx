@@ -6,7 +6,9 @@ import {
   Square, 
   Check,
   AlignVerticalJustifyCenter,
-  MoveVertical
+  MoveVertical,
+  Captions,
+  CaptionsOff
 } from 'lucide-react';
 import type { SubtitleStyleConfig, SubtitlePresetType } from '../../types';
 import { SUBTITLE_PRESETS } from '../../utils/stockMedia';
@@ -22,6 +24,10 @@ export const StyleTab: React.FC<StyleTabProps> = ({
   onChangeStyle,
   onApplyPreset
 }) => {
+  // Optional in the type so old projects keep their subtitles; only an explicit
+  // false counts as off.
+  const subtitlesOn = style.enabled !== false;
+
   const fontOptions = [
     { label: 'Space Grotesk (Modern Display)', value: 'Space Grotesk' },
     { label: 'Inter (Clean Sans)', value: 'Inter' },
@@ -32,6 +38,44 @@ export const StyleTab: React.FC<StyleTabProps> = ({
 
   return (
     <div className="flex flex-col h-full overflow-y-auto p-3 text-[#e4e4e7] space-y-5">
+      {/* Master on/off. Sits above everything because it decides whether any of
+          the settings below apply at all — both in the preview and the export. */}
+      <button
+        onClick={() => onChangeStyle({ enabled: subtitlesOn ? false : true })}
+        className={`w-full flex items-center justify-between gap-3 p-3 rounded-xl border transition-all cursor-pointer ${
+          subtitlesOn
+            ? 'border-[#ffd400]/50 bg-[#ffd400]/10'
+            : 'border-[#27272a] bg-[#18181b] hover:border-[#3f3f46]'
+        }`}
+        title={subtitlesOn ? 'Subtitles are burned into the video' : 'Video will export with no subtitles'}
+      >
+        <span className="flex items-center gap-2">
+          {subtitlesOn
+            ? <Captions size={16} className="text-[#ffd400]" />
+            : <CaptionsOff size={16} className="text-[#71717a]" />}
+          <span className="flex flex-col items-start">
+            <span className="text-xs font-bold text-[#f4f4f5]">Subtitles</span>
+            <span className="text-[10px] text-[#a1a1aa]">
+              {subtitlesOn ? 'Shown in preview and export' : 'Hidden everywhere — clean video'}
+            </span>
+          </span>
+        </span>
+
+        <span
+          className={`relative w-10 h-[22px] rounded-full transition-colors shrink-0 ${
+            subtitlesOn ? 'bg-[#ffd400]' : 'bg-[#3f3f46]'
+          }`}
+        >
+          <span
+            className={`absolute top-[3px] w-4 h-4 rounded-full bg-white transition-all ${
+              subtitlesOn ? 'left-[21px]' : 'left-[3px]'
+            }`}
+          />
+        </span>
+      </button>
+
+      {/* Everything below only matters while subtitles are on. */}
+      <div className={subtitlesOn ? '' : 'opacity-40 pointer-events-none select-none'}>
       {/* Preset Cards Grid */}
       <div>
         <div className="flex items-center gap-1.5 text-xs font-bold text-[#f4f4f5] mb-2.5">
@@ -317,6 +361,7 @@ export const StyleTab: React.FC<StyleTabProps> = ({
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 };

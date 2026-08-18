@@ -509,6 +509,7 @@ export async function createDefaultProject(templateKey = 'cyberpunk'): Promise<V
   const presetStyle = SUBTITLE_PRESETS[selected.preset]?.style || SUBTITLE_PRESETS['tiktok-yellow'].style;
 
   const subtitleStyle: SubtitleStyleConfig = {
+    enabled: true,
     preset: selected.preset,
     fontFamily: presetStyle.fontFamily || 'Space Grotesk',
     fontSize: presetStyle.fontSize || 38,
@@ -709,6 +710,7 @@ export function generateDefaultLiveProject(): VideoProjectData {
   };
 
   const subtitleStyle: SubtitleStyleConfig = {
+    enabled: true,
     preset: 'tiktok-yellow',
     fontFamily: 'Space Grotesk',
     fontSize: 38,

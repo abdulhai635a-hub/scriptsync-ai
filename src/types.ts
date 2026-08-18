@@ -105,9 +105,21 @@ export interface SubtitleStyleConfig {
   chunkMode?: SubtitleChunkMode;
   maxWordsPerChunk?: number; // default 3 - 6 words randomly/rhythmically
   textTransform: 'none' | 'uppercase' | 'capitalize';
+  /**
+   * Whether subtitles are burned into the picture at all. Optional so that
+   * projects saved before this existed keep showing their subtitles: only an
+   * explicit `false` turns them off.
+   */
+  enabled?: boolean;
 }
 
 export interface OverlayConfig {
+  /**
+   * The darkened radial edge over the picture. Off unless asked for — it was
+   * previously drawn on every frame with no way to switch it off, which cost
+   * the corners of every video.
+   */
+  showVignette?: boolean;
   showWatermark: boolean;
   watermarkText: string;
   showProgressBar: boolean;

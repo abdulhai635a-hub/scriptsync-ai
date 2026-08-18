@@ -396,20 +396,31 @@ export function drawFrame(
     }
   }
 
-  // Draw Vignette gradient
-  const vigGrad = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.75);
-  vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
-  vigGrad.addColorStop(1, 'rgba(0,0,0,0.55)');
-  ctx.fillStyle = vigGrad;
-  ctx.fillRect(0, 0, W, H);
+  // Vignette: only when asked for.
+  //
+  // This used to be drawn unconditionally, which darkened the corners of every
+  // frame of every export with no way to turn it off. Artwork that already has
+  // its own lighting — the stick-figure scenes, for one — ends up with a grey
+  // halo and black corners that were never in the source image.
+  if (overlays.showVignette) {
+    const vigGrad = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.75);
+    vigGrad.addColorStop(0, 'rgba(0,0,0,0)');
+    vigGrad.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = vigGrad;
+    ctx.fillRect(0, 0, W, H);
+  }
 
-  // Draw Subtitle / Captions
-  const activeCaption = captions.find(
-    (c) => currentTime >= c.startTime && currentTime <= c.endTime
-  );
+  // Draw Subtitle / Captions.
+  // `enabled` is optional, so only an explicit false hides them — projects
+  // saved before the switch existed keep the subtitles they were built with.
+  if (subtitleStyle.enabled !== false) {
+    const activeCaption = captions.find(
+      (c) => currentTime >= c.startTime && currentTime <= c.endTime
+    );
 
-  if (activeCaption && activeCaption.text) {
-    drawRenderedSubtitle(ctx, activeCaption, currentTime, subtitleStyle, W, H);
+    if (activeCaption && activeCaption.text) {
+      drawRenderedSubtitle(ctx, activeCaption, currentTime, subtitleStyle, W, H);
+    }
   }
 
   // Draw Overlays: Progress bar at bottom
